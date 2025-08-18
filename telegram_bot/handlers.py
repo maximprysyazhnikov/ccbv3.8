@@ -1,95 +1,84 @@
 # telegram_bot/handlers.py
 from __future__ import annotations
-import asyncio, time, math, logging, json, re
-from typing import Tuple, Optional, Dict, List
+import asyncio, math, logging, json, re
+from typing import Optional, List, Tuple
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ContextTypes, Application, CommandHandler, CallbackQueryHandler
 
-from core_config import (
-    MONITORED_SYMBOLS,
-    ANALYZE_TIMEFRAME, ANALYZE_LIMIT,  # лишаємо (ліміт свічок для фетчу)
-    TZ_NAME,
-    OPENROUTER_API_KEY, OPENROUTER_MODEL,
-    LOCAL_LLM_MODEL,
-    # ⬇️ додано
-    ANALYZE_BARS,          # скільки останніх барів беремо в контекст LLM
-    COMPACT_MODE,          # компактний/повний режим промпта
-)
-
-# Дані/TA
-from market_data.binance_data import get_ohlcv, get_latest_price
-from signal_tools.ta_calc import get_ta_indicators
-
-# Інше
-from utils.report_saver import save_report
-from gpt_analyst.symbol_screener import get_top_symbols
-from gpt_analyst.llm_client import chat
-
-# ── Сумісний імпорт аналізатора ──────────────────────────────────────────────
-_run_full_analysis = None
-_analyze_symbol = None
-try:
-    # Новий варіант
-    from gpt_analyst.full_analyzer import run_full_analysis as _run_full_analysis
-except Exception:
-    pass
-try:
-    # Старий варіант
-    from gpt_analyst.full_analyzer import analyze_symbol as _analyze_symbol
-except Exception:
-    pass
+from core_config import CFG
+from router.analyzer_router import pick_route
+from utils.openrouter import chat_completion
+from utils.formatting import save_report
+from utils.ta_formatter import format_ta_report
+from gpt_analyst.full_analyzer import run_full_analysis
+from gpt_decider.decider import decide_from_markdown
+from market_data.candles import get_ohlcv
+from market_data.binance_rank import get_all_usdt_24h, get_top_by_quote_volume_usdt
+from utils.news_fetcher import get_latest_news
 
 log = logging.getLogger("tg.handlers")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# universal send (менш вибагливий: без прев’ю, можна без parse_mode)
+# ──────────────────────────────────────────────────────────────────────────────
+async def _send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *, parse_mode: Optional[str]=None, reply_markup=None):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None and update.callback_query and update.callback_query.message:
+        chat_id = update.callback_query.message.chat_id
+    if chat_id is None and update.message:
+        chat_id = update.message.chat_id
+    if chat_id is None:
+        return
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# UI / Клавіатура
+# UI
 # ──────────────────────────────────────────────────────────────────────────────
 def get_keyboard():
     return ReplyKeyboardMarkup(
-        [["/top", "/analyze", "/ai"], ["/news", "/ping", "/help", "/guide"]],  # /ai — головний аналітик
+        [
+            ["/top", "/analyze", "/ai"],
+            ["/req", "/news", "/ping"],
+            ["/help", "/guide"],
+        ],
         resize_keyboard=True
     )
 
+# ──────────────────────────────────────────────────────────────────────────────
+# helpers
+# ──────────────────────────────────────────────────────────────────────────────
+_VALID_DIR_WORDS = {"LONG", "SHORT", "NEUTRAL"}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Хелпери
-# ──────────────────────────────────────────────────────────────────────────────
 def _current_ai_model() -> str:
     try:
-        if (OPENROUTER_API_KEY or "").strip():
-            return str(OPENROUTER_MODEL or "").strip() or "unknown"
-        return str(LOCAL_LLM_MODEL or "").strip() or "unknown"
+        probe = (CFG.monitored_symbols[0] if CFG.monitored_symbols else "BTCUSDT").upper()
+        route = pick_route(probe)
+        return route.model if route else "unknown"
     except Exception:
         return "unknown"
-
-def _tf_minutes(tf: str) -> int:
-    t = (tf or "").strip().lower()
-    if t.endswith("m"): return int(t[:-1])
-    if t.endswith("h"): return int(t[:-1]) * 60
-    if t.endswith("d"): return int(t[:-1]) * 60 * 24
-    return 15
-
-_VALID_DIR_WORDS = {"LONG", "SHORT", "NEUTRAL"}
 
 def _looks_like_symbol(s: str) -> bool:
     s = (s or "").strip().upper()
     if not (2 <= len(s) <= 20): return False
     if not all(c.isalnum() for c in s): return False
     for q in ("USDT", "FDUSD", "USDC", "BUSD", "BTC", "ETH", "EUR", "TRY"):
-        if s.endswith(q):
-            return True
+        if s.endswith(q): return True
     return False
 
 def _pick_default_symbol() -> str:
     try:
-        for x in MONITORED_SYMBOLS:
+        for x in CFG.monitored_symbols:
             x = (x or "").strip().upper()
-            if _looks_like_symbol(x):
-                return x
+            if _looks_like_symbol(x): return x
     except Exception:
         pass
     return "BTCUSDT"
@@ -98,24 +87,22 @@ def _parse_ai_json(txt: str) -> dict:
     try:
         t = txt.strip()
         if t.startswith("```"):
-            t = t.strip("` \n")
-            t = t.replace("json\n", "", 1).replace("\njson", "").strip("` \n")
+            t = t.strip("` \n").replace("json\n","",1).replace("\njson","").strip("` \n")
         data = json.loads(t)
-        out = {
-            "direction": str(data.get("direction", "")).upper(),
-            "entry": float(data.get("entry", "nan")),
-            "stop": float(data.get("stop", "nan")),
-            "tp": float(data.get("tp", "nan")),
-            "confidence": float(data.get("confidence", 0.0)),
-            "holding_time_hours": float(data.get("holding_time_hours", 0.0)),
-            "holding_time": str(data.get("holding_time", "")).strip(),
-            "rationale": str(data.get("rationale", "")).strip(),
+        return {
+            "direction": str(data.get("direction","")).upper(),
+            "entry": float(data.get("entry","nan")),
+            "stop": float(data.get("stop","nan")),
+            "tp": float(data.get("tp","nan")),
+            "confidence": float(data.get("confidence",0.0)),
+            "holding_time_hours": float(data.get("holding_time_hours",0.0)),
+            "holding_time": str(data.get("holding_time","")).strip(),
+            "rationale": str(data.get("rationale","")).strip(),
         }
-        return out
     except Exception:
         dir_m = re.search(r"\b(LONG|SHORT|NEUTRAL)\b", txt, re.I)
-        def num(key_regex):
-            m = re.search(key_regex + r"\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
+        def num(rx):
+            m = re.search(rx + r"\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", txt, re.I)
             return float(m.group(1)) if m else float("nan")
         return {
             "direction": dir_m.group(1).upper() if dir_m else "NEUTRAL",
@@ -136,232 +123,179 @@ def _fmt_or_dash(v):
 
 def _rr(direction: str, entry: float, stop: float, tp: float) -> str:
     try:
-        if any(math.isnan(x) for x in [entry, stop, tp]):
-            return "-"
+        if any(math.isnan(x) for x in [entry,stop,tp]): return "-"
         if direction == "LONG":
-            risk = entry - stop
-            reward = tp - entry
+            risk = entry - stop; reward = tp - entry
         elif direction == "SHORT":
-            risk = stop - entry
-            reward = entry - tp
+            risk = stop - entry; reward = entry - tp
         else:
             return "-"
-        if risk <= 0 or reward <= 0:
-            return "-"
+        if risk <= 0 or reward <= 0: return "-"
         return f"{reward/risk:.2f}"
     except Exception:
         return "-"
 
+def _chunk(lst: List[str], n: int) -> List[List[str]]:
+    return [lst[i:i+n] for i in range(0, len(lst), n)]
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Сервісні
+# service
 # ──────────────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Привіт! Я трейд-бот. Команди нижче.", reply_markup=get_keyboard())
+    await _send(update, context, "👋 Привіт! Я трейд-бот. Команди нижче.", reply_markup=get_keyboard())
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Команди:\n"
-        "/top — топ-20 монет за скором (весь Binance), швидкий дайджест\n"
-        f"/analyze — повний аналіз по MONITORED_SYMBOLS (TF={ANALYZE_TIMEFRAME})\n"
-        "/ai <SYMBOL> [TF] — розгорнутий AI-план (entry/SL/TP, RR, час утримання)\n"
-        "/news — заголовки з крипто-RSS\n"
-        "/ping — діагностика\n"
-        "/guide — як читати AI-план\n\n"
-        f"Активна AI-модель: {_current_ai_model()}"
+    text = (
+        "🆘 *Довідка*\n\n"
+        "Доступні команди:\n"
+        "• `/top` — Топ-20 USDT пар (режими: *Volume* / *Gainers*). Натисни на монету → меню дій (*🤖 AI* або *🔗 Залежність BTC/ETH*).\n"
+        f"• `/analyze` — Повний аналіз по `MONITORED_SYMBOLS` (TF={CFG.analyze_timeframe}), зі збереженням звітів.\n"
+        "• `/ai <SYMBOL> [TF]` — Короткий AI-план (Entry/SL/TP, RR, утримання) + індикатори з нашого пресета.\n"
+        "• `/req <SYMBOL> [TF]` — Залежність монети від BTC/ETH (ρ, β, Δ Ratio) з AI-коментарем (якщо ключ заданий).\n"
+        "• `/news [запит]` — Останні заголовки (швидко, без форматування). Приклади: `/news`, `/news gold`, `/news btc`.\n"
+        "• `/ping` — Перевірка стану.\n"
+        "• `/guide` — Як читати AI-план та метрики.\n\n"
+        f"🧠 Активна AI-модель: `{_current_ai_model()}`\n"
+        f"⏱ Часовий пояс: `{getattr(CFG, 'tz_name', 'UTC')}`"
     )
+    await _send(update, context, text, parse_mode="Markdown")
 
 async def guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "📖 *Як читати AI-план*\n\n"
-        f"Використання: `/ai BTCUSDT` — аналізує ринкові дані на TF={ANALYZE_TIMEFRAME} і повертає план.\n\n"
-        "📌 *Поля:*\n"
-        "- *Direction* – LONG/SHORT/NEUTRAL (напрям ідеї)\n"
-        "- *Confidence* – впевненість (0–1)\n"
-        "- *RR* – ризик/прибуток (>1.5 добре, 2.0+ краще)\n"
-        "- *Entry / SL / TP* – рівні входу/стопу/тейку\n"
-        "- *Recommended hold* – скільки тримати позицію та дедлайн у твоєму time zone\n"
-        "- *— пояснення —* – коротка логіка рішення\n\n"
-        "💡 *Поради:*\n"
-        "• Якщо RR < 1.5 — краще пошукати кращу точку входу.\n"
-        "• Дивись на EMA50/EMA200 (тренд) та ADX (сила тренду).\n"
-        "• RSI/StochRSI — для фільтрації імпульсів.\n"
+        "📖 *Гайд: як користуватись ботом*\n\n"
+        "1) **/top** — Топ-20 USDT пар, перемикай *Volume/Gainers*, тисни на символ → *🤖 AI* або *🔗 Залежність*.\n\n"
+        "2) **/ai <SYMBOL> [TF]** — Direction, Confidence(0–1), RR, Entry/SL/TP, утримання + 12 індикаторів.\n"
+        "   Порада: якщо RR < 1.5 — краще дочекатись кращої точки входу.\n\n"
+        "3) **/req <SYMBOL> [TF]** — ρ(30/90), β, Δ Ratio(30) до BTC/ETH + короткий коментар.\n\n"
+        f"4) **/analyze** — повний звіт по `MONITORED_SYMBOLS` на TF={CFG.analyze_timeframe}."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await _send(update, context, text, parse_mode="Markdown")
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🏓 pong all ok | AI model: {_current_ai_model()}")
-
+    await _send(update, context, f"🏓 pong all ok | AI model: {_current_ai_model()}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# NEWS (опційно)
+# /news — спрощений, швидкий, без Markdown/HTML
 # ──────────────────────────────────────────────────────────────────────────────
 async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        from market_data.news import get_latest_news
-        items = get_latest_news(limit=8)
+        args = context.args or []
+        query = " ".join(args).strip() if args else None
+        # Швидкий режим: менше елементів
+        items = get_latest_news(query=query, max_items=8, lang=getattr(CFG, "news_lang", "uk"))
         if not items:
-            await update.message.reply_text("📰 Немає свіжих заголовків зараз.")
+            await _send(update, context, "📰 Немає свіжих заголовків зараз.")
             return
-        lines = ["📰 Останні заголовки:\n"]
+        lines = ["📰 Останні заголовки:"]
         for it in items:
-            lines.append(f"• {it['title']} — {it['link']}")
-        text = "\n".join(lines)
-        await update.message.reply_text(text[:4000])
+            # Жодного форматування Markdown/HTML — лише plain text
+            title = it.get("title") or ""
+            link = it.get("link") or ""
+            src  = it.get("source") or ""
+            if src:
+                lines.append(f"• {title} — {src}\n  {link}")
+            else:
+                lines.append(f"• {title}\n  {link}")
+        msg = "\n".join(lines)
+        await _send(update, context, msg[:4000])  # parse_mode=None
     except Exception as e:
         log.exception("/news failed")
-        await update.message.reply_text(f"⚠️ news error: {e}")
-
+        await _send(update, context, f"⚠️ news error: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# /top — Топ-20 по всьому Binance (паралельно + кеш)
+# /top — Volume / Gainers + «меню монети»
 # ──────────────────────────────────────────────────────────────────────────────
-_TOP_CACHE: Dict[str, object] = {"text": "", "ts": 0.0, "busy": False}
-TOP_TTL_SEC = 120
-MAX_CONCURRENCY = 12
-DETAIL_POOL_SIZE = 60
+TOP_MODE_VOLUME = "volume"
+TOP_MODE_GAINERS = "gainers"
 
-def _bias_from_row(row) -> str:
-    try:
-        rsi = float(row.get("rsi"))
-        macd_d = float(row.get("macd")) - float(row.get("macd_signal"))
-        sma7 = float(row.get("sma_7"))
-        sma25 = float(row.get("sma_25"))
-    except Exception:
-        return "NEUTRAL"
-    if sma7 > sma25 and macd_d > 0 and rsi >= 52: return "LONG"
-    if sma7 < sma25 and macd_d < 0 and rsi <= 48: return "SHORT"
-    return "NEUTRAL"
+def _build_top_text(rows: List[dict]) -> Tuple[str, List[str]]:
+    def fmt_vol(usdt: float) -> str:
+        a = abs(usdt)
+        if a >= 1_000_000_000: return f"{usdt/1_000_000_000:.2f}B"
+        if a >= 1_000_000:     return f"{usdt/1_000_000:.1f}M"
+        if a >= 1_000:         return f"{usdt/1_000:.1f}K"
+        return f"{usdt:.0f}"
 
-def _fmt_line(symbol: str, bias: str, price: float, rsi: float, macd_delta: float, atr_pct: Optional[float]) -> str:
-    dot = "🟢" if bias == "LONG" else "🔴" if bias == "SHORT" else "⚪️"
-    atr_txt = "-" if (atr_pct is None or (isinstance(atr_pct, float) and math.isnan(atr_pct))) else f"{atr_pct:.3f}%"
-    return f"{dot} {bias} {symbol}  | P={price:.4f}  | RSI={rsi:.1f}  | MACDΔ={macd_delta:.4f}  | ATR%={atr_txt}"
+    lines, symbols = [], []
+    lines.append("_Symbol | Price | 24h% | QuoteVol_\n")
+    for i, r in enumerate(rows, 1):
+        sym = r["symbol"]; symbols.append(sym)
+        price = r["lastPrice"]; chg = r["priceChangePercent"]; vol = r["quoteVolume"]
+        emoji = "🟢" if chg >= 0 else "🔴"
+        lines.append(f"{i:>2}. `{sym}` | `{price:,.6f}` | {emoji} `{chg:+.2f}%` | `{fmt_vol(vol)}`")
+    return "\n".join(lines), symbols
 
-async def _detail_one(symbol: str) -> Optional[Tuple[str, str, float, float, float, Optional[float]]]:
-    try:
-        def _work():
-            df = get_ohlcv(symbol, ANALYZE_TIMEFRAME, ANALYZE_LIMIT)
-            if df is None or df.empty:
-                return None
-            inds = get_ta_indicators(df)
-            last = inds.iloc[-1]
-            price = float(last.get("close", 0.0))
-            rsi = float(last.get("rsi", 50.0))
-            macd_d = float(last.get("macd", 0.0)) - float(last.get("macd_signal", 0.0))
-            atr = float(last.get("atr_14", 0.0))
-            atr_pct = (atr / price * 100) if price else None
-            bias = _bias_from_row(last)
-            return (symbol, bias, price, rsi, macd_d, atr_pct)
-        return await asyncio.to_thread(_work)
-    except Exception:
-        return None
+def _top_mode_buttons(active: str) -> list[list[InlineKeyboardButton]]:
+    vol = InlineKeyboardButton(("✅ Volume" if active==TOP_MODE_VOLUME else "Volume"), callback_data="topmode:volume")
+    gai = InlineKeyboardButton(("✅ Gainers" if active==TOP_MODE_GAINERS else "Gainers"), callback_data="topmode:gainers")
+    return [[vol, gai]]
 
-async def _build_top_text() -> str:
-    candidates = get_top_symbols(DETAIL_POOL_SIZE) or []
-    if not candidates:
-        return f"🏆 Топ-20 монет за скором (TF={ANALYZE_TIMEFRAME})\n⚠️ Немає даних для відбору."
+async def _send_top(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    if mode == TOP_MODE_GAINERS:
+        all_rows = await asyncio.to_thread(get_all_usdt_24h)
+        all_rows.sort(key=lambda x: x["priceChangePercent"], reverse=True)
+        rows = all_rows[:20]
+        header = "🏆 *Топ-20 USDT пар — Gainers (24h %)*\n"
+    else:
+        rows = await asyncio.to_thread(get_top_by_quote_volume_usdt, 20)
+        header = "🏆 *Топ-20 USDT пар — Volume (24h QuoteVol)*\n"
 
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
-    async def _guarded(sym):
-        async with sem:
-            return await _detail_one(sym)
+    text_body, symbols = _build_top_text(rows)
 
-    tasks = [asyncio.create_task(_guarded(s)) for s in candidates]
-    results = [r for r in await asyncio.gather(*tasks) if r]
+    sym_rows = []
+    for chunk in _chunk(symbols, 4):
+        sym_rows.append([InlineKeyboardButton(text=s, callback_data=f"sym:{s}") for s in chunk])
 
-    def strength(row):
-        _, bias, _, rsi, macd_d, atr_pct = row
-        score = 0.0
-        if bias == "LONG":
-            score += 2.0 + max(0.0, min(1.0, (rsi - 50.0) / 20.0)) + max(0.0, min(1.0, macd_d)) * 0.5
-        elif bias == "SHORT":
-            score += 2.0 + max(0.0, min(1.0, (50.0 - rsi) / 20.0)) + max(0.0, min(1.0, -macd_d)) * 0.5
-        else:
-            score += 1.0
-        if atr_pct and not math.isnan(atr_pct):
-            score += min(1.0, atr_pct / 1.0) * 0.1
-        return score
-
-    results.sort(key=strength, reverse=True)
-    top20 = results[:20]
-
-    header = (
-        f"🏆 Топ-20 монет за скором (TF={ANALYZE_TIMEFRAME})\n"
-        "📊 Колонки:\n"
-        "P — остання ціна (4 знаки)\n"
-        "RSI — RSI(14), 0.1\n"
-        "MACDΔ — MACD − Signal, 4 знаки\n"
-        "ATR% — ATR(14) / Price * 100, 3 знаки\n"
-        "Time — Europe/Kyiv (час не дублюємо в рядках)\n"
-    )
-    body = "\n".join(_fmt_line(*r) for r in top20)
-    return (header + "\n" + body)[:4000]
+    kb = InlineKeyboardMarkup(sym_rows + _top_mode_buttons(mode))
+    await _send(update, context, (header + text_body)[:4000], parse_mode="Markdown", reply_markup=kb)
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    now = time.time()
-    if (_TOP_CACHE["text"] and (now - float(_TOP_CACHE["ts"]) <= TOP_TTL_SEC)):
-        await update.message.reply_text(_TOP_CACHE["text"])
-        return
-
-    await update.message.reply_text(f"⏳ Рахую топ по всьому Binance (TF={ANALYZE_TIMEFRAME})… Зачекай кілька секунд…")
-
-    if _TOP_CACHE["busy"]:
-        for _ in range(30):
-            await asyncio.sleep(0.5)
-            if (_TOP_CACHE["text"] and (time.time() - float(_TOP_CACHE["ts"]) <= TOP_TTL_SEC)):
-                await update.message.reply_text(_TOP_CACHE["text"])
-                return
-        await update.message.reply_text("⌛️ Дані ще готуються — надішлю як тільки будуть готові.")
-        return
-
-    async def _compute_and_send(chat_id: int):
-        try:
-            _TOP_CACHE["busy"] = True
-            text = await _build_top_text()
-            _TOP_CACHE["text"] = text
-            _TOP_CACHE["ts"] = time.time()
-            await context.bot.send_message(chat_id=chat_id, text=text)
-        except Exception as e:
-            log.exception("top build failed")
-            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ top build error: {e}")
-        finally:
-            _TOP_CACHE["busy"] = False
-
-    asyncio.create_task(_compute_and_send(update.effective_chat.id))
-
+    mode = TOP_MODE_GAINERS if (context.args and context.args[0].lower().startswith("gain")) else TOP_MODE_VOLUME
+    await _send_top(update, context, mode)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# /analyze — повний аналіз по MONITORED_SYMBOLS (підтримка двох API)
+# «меню монети»
+# ──────────────────────────────────────────────────────────────────────────────
+async def on_cb_sym(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = (q.data or "")
+    if not data.startswith("sym:"): return
+    sym = data.split(":",1)[1].upper()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🤖 AI {sym}", callback_data=f"ai:{sym}")],
+        [InlineKeyboardButton(f"🔗 Залежність BTC/ETH {sym}", callback_data=f"dep:{sym}")],
+    ])
+    await _send(update, context, f"Вибери дію для `{sym}`:", parse_mode="Markdown", reply_markup=kb)
+
+async def on_cb_topmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = (q.data or "")
+    if not data.startswith("topmode:"): return
+    mode = data.split(":",1)[1]
+    if mode not in (TOP_MODE_VOLUME, TOP_MODE_GAINERS):
+        mode = TOP_MODE_VOLUME
+    await _send_top(update, context, mode)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /analyze — повний аналіз + індикатори
 # ──────────────────────────────────────────────────────────────────────────────
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"⏳ Аналізую на TF={ANALYZE_TIMEFRAME}… Зачекай кілька секунд…")
-    for s in MONITORED_SYMBOLS:
+    await _send(update, context, f"⏳ Аналізую на TF={CFG.analyze_timeframe}…")
+    for s in CFG.monitored_symbols:
         try:
-            text_out = None
-            if _run_full_analysis:
-                # очікувані сигнатури: (symbol, timeframe) або (symbol,)
-                try:
-                    res = _run_full_analysis(s, ANALYZE_TIMEFRAME)
-                except TypeError:
-                    res = _run_full_analysis(s)
-                text_out = "\n".join(res) if isinstance(res, (list, tuple)) else str(res)
-            elif _analyze_symbol:
-                res = _analyze_symbol(s)
-                text_out = str(res)
-            else:
-                text_out = "⚠️ Немає ні run_full_analysis, ні analyze_symbol у gpt_analyst.full_analyzer."
-
-            if text_out:
-                save_report(s, text_out)
-                await update.message.reply_text(text_out[:4000], parse_mode="Markdown")
+            lines = await asyncio.to_thread(run_full_analysis, s, CFG.analyze_timeframe, CFG.default_bars)
+            save_report(s, lines)
+            ta_block = format_ta_report(s, CFG.analyze_timeframe, CFG.analyze_limit)
+            reply_text = "\n".join(lines) + "\n\n📊 Indicators:\n" + ta_block
+            await _send(update, context, reply_text[:4000], parse_mode="Markdown")
         except Exception as e:
             log.exception("analyze %s failed", s)
-            await update.message.reply_text(f"⚠️ analyze {s} error: {e}")
-
+            await _send(update, context, f"⚠️ analyze {s} error: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# /ai — розгорнутий план (TA-контекст: EMA/MACD/RSI/ATR/OBV/MFI/ADX/CCI/Pivots)
+# /ai — план + RR-фільтр + індикатори
 # ──────────────────────────────────────────────────────────────────────────────
 AI_SYSTEM = (
     "You are a concise crypto trading assistant. "
@@ -369,189 +303,306 @@ AI_SYSTEM = (
     '{"direction":"LONG|SHORT|NEUTRAL","entry":number,"stop":number,"tp":number,'
     '"confidence":0..1,"holding_time_hours":number,"holding_time":"string",'
     '"rationale":"2-3 sentences"} '
-    "Use only the provided trend/momentum/volatility/strength/volume/pivots data. "
+    "Use trend/momentum/volatility/strength/volume/pivots data. "
     "Prefer ~1:3 risk-reward when reasonable."
 )
+CONF_RR_MIN = 1.5
 
-async def ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ai(update: Update, context: ContextTypes.DEFAULT_TYPE, *, symbol_arg: Optional[str] = None, timeframe_arg: Optional[str] = None):
     args = context.args or []
-    raw = (args[0] if args else "").strip().upper()
-    timeframe = (args[1] if len(args) > 1 else ANALYZE_TIMEFRAME).strip()
+    raw = symbol_arg or (args[0] if args else "")
+    raw = raw.strip().upper()
+    timeframe = (timeframe_arg or (args[1] if len(args) > 1 else CFG.analyze_timeframe)).strip()
 
     if not raw:
         symbol = _pick_default_symbol()
     elif raw in _VALID_DIR_WORDS:
-        await update.message.reply_text("ℹ️ Це схоже на *напрям*, а не символ. Приклад: `/ai BTCUSDT`.")
+        await _send(update, context, "ℹ️ Це схоже на напрям, а не символ. Приклад: `/ai BTCUSDT`.")
         return
     elif not _looks_like_symbol(raw):
-        await update.message.reply_text("⚠️ Невірний символ. Приклад: `/ai BTCUSDT`.")
+        await _send(update, context, "⚠️ Невірний символ. Приклад: `/ai BTCUSDT`.")
         return
     else:
         symbol = raw
 
-    await update.message.reply_text(
-        f"⏳ Рахую індикатори для {symbol} (TF={timeframe}, bars={ANALYZE_BARS}, mode={'COMPACT' if COMPACT_MODE else 'FULL'})…"
-    )
+    await _send(update, context, f"⏳ Рахую індикатори для {symbol} (TF={timeframe})…")
 
     try:
-        # 1) Дані ринку (свічки + індикатори)
-        def _work():
-            # Фетчимо з запасом по ANALYZE_LIMIT, але LLM-контексту дамо ANALYZE_BARS
-            df = get_ohlcv(symbol, timeframe, ANALYZE_LIMIT)
-            inds = get_ta_indicators(df)
-            last = inds.iloc[-1]
-            price = float(last.get("close", float("nan")))
-            return inds, last, price
-        inds, last, price = await asyncio.to_thread(_work)
+        data = get_ohlcv(symbol, timeframe, CFG.analyze_limit)
+        last_close = data[-1]["close"] if data else float("nan")
 
-        # 2) Вікно для LLM: останні ANALYZE_BARS
-        win = inds.tail(ANALYZE_BARS).copy()
-        block: List[str] = []
-        block.append(f"SYMBOL: {symbol}")
-        block.append(f"TF: {timeframe}")
-        block.append(f"PRICE_LAST: {price:.6f}")
+        block = [
+            f"SYMBOL: {symbol}",
+            f"TF: {timeframe}",
+            f"PRICE_LAST: {last_close:.6f}",
+            f"BARS: {min(len(data), CFG.analyze_limit)}",
+        ]
+        route = pick_route(symbol)
+        if not route:
+            await _send(update, context, f"❌ Немає доступного API-роутингу для {symbol}")
+            return
 
-        if COMPACT_MODE:
-            # Стисле резюме ключових фіч
-            ema50 = float(last.get('ema_50', last.get('EMA50', float('nan'))))
-            ema200 = float(last.get('ema_200', last.get('EMA200', float('nan'))))
-            rsi_avg = float(win['rsi'].mean()) if 'rsi' in win.columns else float('nan')
-            macd = float(last.get('macd', last.get('MACD', float('nan'))))
-            atr_avg = float(win['atr_14'].mean()) if 'atr_14' in win.columns else (float(win['ATR'].mean()) if 'ATR' in win.columns else float('nan'))
-            adx = float(last.get('adx', last.get('ADX', float('nan'))))
-
-            block += [
-                f"EMA50_last: {ema50:.6f}",
-                f"EMA200_last: {ema200:.6f}",
-                f"RSI_avg_{ANALYZE_BARS}: {rsi_avg:.4f}",
-                f"MACD_last: {macd:.6f}",
-                f"ATR_avg_{ANALYZE_BARS}: {atr_avg:.6f}",
-                f"ADX_last: {adx:.4f}",
-            ]
-        else:
-            # Повний блок: основні індикатори + кілька осциляторів/півотів
-            # Тренд
-            block.append(f"EMA50_last: {float(last.get('ema_50', last.get('EMA50', float('nan')))):.6f}")
-            block.append(f"EMA200_last: {float(last.get('ema_200', last.get('EMA200', float('nan')))):.6f}")
-
-            # MACD/Signal
-            block.append(f"MACD_last: {float(last.get('macd', last.get('MACD', float('nan')))):.6f}")
-            block.append(f"MACD_SIGNAL_last: {float(last.get('macd_signal', last.get('MACD_SIGNAL', float('nan')))):.6f}")
-
-            # RSI / StochRSI середнє/останнє
-            rsi_col = 'rsi' if 'rsi' in win.columns else ('RSI' if 'RSI' in win.columns else None)
-            rsi_avg = float(win[rsi_col].mean()) if rsi_col else float('nan')
-            block.append(f"RSI_avg_{ANALYZE_BARS}: {rsi_avg:.4f}")
-            block.append(f"StochRSI_K_last: {float(last.get('stochrsi_k', last.get('STOCHRSI_K', float('nan')))):.4f}")
-            block.append(f"StochRSI_D_last: {float(last.get('stochrsi_d', last.get('STOCHRSI_D', float('nan')))):.4f}")
-
-            # Волатильність
-            atr_col = 'atr_14' if 'atr_14' in win.columns else ('ATR' if 'ATR' in win.columns else None)
-            atr_avg = float(win[atr_col].mean()) if atr_col else float('nan')
-            pctb = float(last.get('pct_b', last.get('PCTB', float('nan'))))
-            block.append(f"ATR_avg_{ANALYZE_BARS}: {atr_avg:.6f}")
-            block.append(f"BB_pctB_last: {pctb:.4f}")
-
-            # Обʼєм/сила
-            if 'obv' in last or 'OBV' in last:
-                block.append(f"OBV_last: {float(last.get('obv', last.get('OBV', 0.0))):.0f}")
-            if 'mfi' in last or 'MFI' in last:
-                block.append(f"MFI_last: {float(last.get('mfi', last.get('MFI', float('nan')))):.4f}")
-            block.append(f"ADX_last: {float(last.get('adx', last.get('ADX', float('nan')))):.4f}")
-            block.append(f"CCI_last: {float(last.get('cci', last.get('CCI', float('nan')))):.4f}")
-
-            # Півоти (звичайні + Fib, якщо є)
-            for key in ["pivot", "r1", "s1", "r2", "s2", "r3", "s3",
-                        "fib_pivot", "fib_r1", "fib_s1", "fib_r2", "fib_s2", "fib_r3", "fib_s3"]:
-                if key in last.index:
-                    try:
-                        block.append(f"{key.upper()}: {float(last.get(key, float('nan'))):.6f}")
-                    except Exception:
-                        pass
-
-        market_block = "\n".join(block)
-
-        # 3) Prompt для ШІ
         prompt = (
-            f"{market_block}\n\n"
+            "\n".join(block) + "\n\n"
             "Decide if there is a trade now. Return STRICT JSON only (no prose) with keys exactly:\n"
             '{"direction":"LONG|SHORT|NEUTRAL","entry":number,"stop":number,"tp":number,'
             '"confidence":0..1,"holding_time_hours":number,"holding_time":"string","rationale":"2-3 sentences"}.\n'
-            "Use trend (EMAs), momentum (MACD/RSI/StochRSI), volatility (ATR/BB), strength (ADX/CCI), volume (OBV/MFI), and Pivots."
+            "Use trend, momentum (MACD/RSI), volatility (ATR/BB), strength (ADX/CCI), volume (OBV/MFI), and Pivots (assume computed)."
         )
-        raw = chat([{"role":"system","content":AI_SYSTEM},{"role":"user","content":prompt}])
-        plan = _parse_ai_json(raw)
 
-        # 4) Нормалізація + holding time
+        raw_resp = chat_completion(
+            endpoint=CFG.analyzer_endpoint,
+            api_key=route.api_key,
+            model=route.model,
+            messages=[{"role":"system","content":AI_SYSTEM},{"role":"user","content":prompt}],
+            timeout=25
+        )
+        plan = _parse_ai_json(raw_resp)
+
         direction = (plan.get("direction") or "").upper()
         entry = float(plan.get("entry", math.nan))
         stop = float(plan.get("stop", math.nan))
         tp   = float(plan.get("tp", math.nan))
         conf = float(plan.get("confidence", 0.0))
 
-        # RR-фільтр: якщо < 1.5 — скіпаємо
         rr_text = _rr(direction, entry, stop, tp)
         try:
-            if rr_text != "-" and float(rr_text) < 1.5:
-                await update.message.reply_text("⚠️ Слабкий сигнал (RR < 1.5) — скіп.")
+            if rr_text != "-" and float(rr_text) < CONF_RR_MIN:
+                await _send(update, context, f"⚠️ Слабкий сигнал (RR < {CONF_RR_MIN}) — скіп.")
                 return
         except Exception:
-            pass  # якщо rr не розпарсився — не блокуємо, але покажемо як "-"
+            pass
 
-        # Обчислення holding time
-        hold_source = "AI"
-        hold_h = float(plan.get("holding_time_hours", 0.0))
-        if hold_h <= 0.0:
-            hold_source = "heuristic"
-            # оцінимо швидкість за ATR% (беремо середнє по вікну)
-            try:
-                atr_col = 'atr_14' if 'atr_14' in win.columns else ('ATR' if 'ATR' in win.columns else None)
-                atr_avg = float(win[atr_col].mean()) if atr_col else 0.0
-                atr_pct = (atr_avg / float(price) * 100.0) if price and atr_avg == atr_avg else 0.0
-            except Exception:
-                atr_pct = 0.0
-            base_hours = max(1, _tf_minutes(timeframe) / 15 * 2)
-            if atr_pct >= 2.0:   speed_adj = 0.5
-            elif atr_pct >= 1.0: speed_adj = 0.75
-            elif atr_pct <= 0.2: speed_adj = 1.5
-            else:                speed_adj = 1.0
-            hold_h = float(int(round(base_hours * speed_adj)))
-
-        if direction == "NEUTRAL":
-            entry = stop = tp = float("nan")
-
-        # 5) Вивід із TZ_NAME + час генерації
-        tz = ZoneInfo(TZ_NAME)
+        tz = ZoneInfo(CFG.tz_name)
         now_local = datetime.now(tz)
+        hold_h = float(plan.get("holding_time_hours", 0.0))
         hold_until_local = now_local + timedelta(hours=hold_h) if hold_h > 0 else None
         hold_line = (
-            f"Recommended hold: {int(round(hold_h))} h ({hold_source})"
-            + (f" (до {hold_until_local.strftime('%Y-%m-%d %H:%M %Z')} / {TZ_NAME})" if hold_until_local else "")
+            f"Recommended hold: {int(round(hold_h))} h"
+            + (f" (до {hold_until_local.strftime('%Y-%m-%d %H:%M %Z')} / {CFG.tz_name})" if hold_until_local else "")
         )
         stamp_line = f"Generated: {now_local.strftime('%Y-%m-%d %H:%M %Z')}"
 
         reply = (
-            f"🤖 AI план для {symbol} (TF={timeframe})\n"
-            f"Модель: {_current_ai_model()}\n"
-            f"{stamp_line}\n"
-            f"Direction: {direction or '-'}   | Confidence: {conf:.2f}   | RR: {rr_text}\n"
-            f"Entry: {_fmt_or_dash(entry)}    | SL: {_fmt_or_dash(stop)}   | TP: {_fmt_or_dash(tp)}\n"
-            f"{hold_line}\n"
-            "— пояснення —\n"
-            f"{plan.get('rationale','—')}"
+            f"🤖 *AI Trade Plan* for {symbol} (TF={timeframe})\n"
+            f"📌 Model: {_current_ai_model()}\n"
+            f"🕒 {stamp_line}\n\n"
+            f"➡️ *Direction*: `{direction or '-'}`\n"
+            f"📊 *Confidence*: `{conf:.2%}`\n"
+            f"⚖️ *RR*: `{rr_text}`\n"
+            f"💰 *Entry*: `{_fmt_or_dash(entry)}`\n"
+            f"🛑 *Stop*: `{_fmt_or_dash(stop)}`\n"
+            f"🎯 *Take*: `{_fmt_or_dash(tp)}`\n"
+            f"⏳ {hold_line}\n\n"
+            f"🧾 *Reasoning*:\n{plan.get('rationale','—')}\n\n"
+            "📈 *Indicators (preset)*:\n"
+            f"{format_ta_report(symbol, timeframe, CFG.analyze_limit)}"
         )
-        await update.message.reply_text(reply)
+        await _send(update, context, reply, parse_mode="Markdown")
 
     except Exception as e:
         log.exception("/ai failed")
-        await update.message.reply_text(f"⚠️ ai error: {e}")
-
+        await _send(update, context, f"⚠️ ai error: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Callback stub (на майбутнє)
+# ЗАЛЕЖНІСТЬ BTC/ETH → <SYMBOL>  (швидший фолбек; AI тільки якщо ключ заданий)
 # ──────────────────────────────────────────────────────────────────────────────
-async def on_cb_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _pct(series: List[float]) -> List[float]:
+    out = []
+    for i in range(1, len(series)):
+        prev = series[i-1] or 0.0
+        out.append(0.0 if prev == 0 else (series[i]-series[i-1]) / prev)
+    return out
+
+def _corr(a: List[float], b: List[float]) -> float:
+    import statistics as st
+    n = min(len(a), len(b))
+    if n < 3: return float("nan")
+    a, b = a[:n], b[:n]
     try:
-        await update.callback_query.answer("Soon™")
+        ma, mb = st.mean(a), st.mean(b)
+        cov = sum((x-ma)*(y-mb) for x,y in zip(a,b)) / (n-1)
+        va = sum((x-ma)**2 for x in a) / (n-1)
+        vb = sum((y-mb)**2 for y in b) / (n-1)
+        if va <= 0 or vb <= 0: return float("nan")
+        return cov / (va**0.5 * vb**0.5)
     except Exception:
-        pass
+        return float("nan")
+
+def _beta(dep: List[float], indep: List[float]) -> float:
+    import statistics as st
+    n = min(len(dep), len(indep))
+    if n < 3: return float("nan")
+    dep, indep = dep[:n], indep[:n]
+    md, mi = st.mean(dep), st.mean(indep)
+    cov = sum((x-md)*(y-mi) for x,y in zip(dep,indep)) / (n-1)
+    var_i = sum((y-mi)**2 for y in indep) / (n-1)
+    if var_i <= 0: return float("nan")
+    return cov / var_i
+
+DEP_SYSTEM = (
+    "You are a quantitative crypto assistant. "
+    "Given correlations, betas and ratio changes for a symbol vs BTC/ETH, "
+    "return exactly 3 short Ukrainian bullets (max 18 words each), no extra text."
+)
+
+def _heuristic_dep_bullets(symbol: str, corr_btc_30, corr_eth_30, corr_btc_90, corr_eth_90, beta_btc, beta_eth, rbtc, reth) -> str:
+    tips = []
+    hi = lambda x: (isinstance(x, (int,float)) and x==x and x>=0.6)
+    lo = lambda x: (isinstance(x, (int,float)) and x==x and x<0.3)
+    if hi(corr_btc_30) or hi(corr_eth_30):
+        tips.append(f"{symbol}: висока короткострокова кореляція з лідерами — рух синхронний, ризик системний.")
+    if hi(beta_btc) or hi(beta_eth):
+        tips.append(f"{symbol}: β>1 — амплітуда більша за лідера, підсилює тренд й ризик.")
+    if lo(corr_btc_90) and lo(corr_eth_90):
+        tips.append(f"{symbol}: низька довгострокова кореляція — власні драйвери, диверсифікаційний ефект.")
+    if isinstance(rbtc,(int,float)) and rbtc==rbtc:
+        tips.append(f"{symbol}: відносно BTC за 30 барів {rbtc*100:+.2f}% — оцінка сили/слабкості.")
+    if isinstance(reth,(int,float)) and reth==reth:
+        tips.append(f"{symbol}: відносно ETH за 30 барів {reth*100:+.2f}% — підтверджено другим лідером.")
+    if not tips:
+        tips = [f"{symbol}: звʼязок із BTC/ETH помірний; корисні фільтри тренду (EMA/ADX) та обʼєм."]
+    return "\n".join("- " + t for t in tips[:3])
+
+async def _dependency_report(symbol: str, timeframe: str, limit: int = 300) -> str:
+    t_data = get_ohlcv(symbol, timeframe, limit)
+    b_data = get_ohlcv("BTCUSDT", timeframe, limit)
+    e_data = get_ohlcv("ETHUSDT", timeframe, limit)
+    if not t_data or not b_data or not e_data:
+        return "_No data to compute dependency_"
+
+    t_close = [x["close"] for x in t_data]
+    b_close = [x["close"] for x in b_data]
+    e_close = [x["close"] for x in e_data]
+
+    t_ret = _pct(t_close); b_ret = _pct(b_close); e_ret = _pct(e_close)
+
+    win30 = 30 if len(t_ret) >= 30 else len(t_ret)
+    win90 = 90 if len(t_ret) >= 90 else len(t_ret)
+
+    corr_btc_30 = _corr(t_ret[-win30:], b_ret[-win30:])
+    corr_eth_30 = _corr(t_ret[-win30:], e_ret[-win30:])
+    corr_btc_90 = _corr(t_ret[-win90:], b_ret[-win90:])
+    corr_eth_90 = _corr(t_ret[-win90:], e_ret[-win90:])
+
+    beta_btc = _beta(t_ret[-win90:], b_ret[-win90:])
+    beta_eth = _beta(t_ret[-win90:], e_ret[-win90:])
+
+    ratio_btc_change = (t_close[-1] / b_close[-1]) / (t_close[-win30] / b_close[-win30]) - 1 if win30>=2 else float("nan")
+    ratio_eth_change = (t_close[-1] / e_close[-1]) / (t_close[-win30] / e_close[-win30]) - 1 if win30>=2 else float("nan")
+
+    # AI-коментар: викликаємо лише якщо є ключ+модель
+    ai_text = None
+    api_key_1 = getattr(CFG, "help_api_key8", None) or getattr(CFG, "HELP_API_KEY8", None)
+    model_1   = getattr(CFG, "help_api_key8_model", None) or getattr(CFG, "HELP_API_KEY8_MODEL", None)
+
+    if api_key_1 and model_1:
+        hints = (
+            f"SYMBOL={symbol}\nTF={timeframe}\n"
+            f"corr_btc_30={corr_btc_30:.3f}\ncorr_eth_30={corr_eth_30:.3f}\n"
+            f"corr_btc_90={corr_btc_90:.3f}\ncorr_eth_90={corr_eth_90:.3f}\n"
+            f"beta_btc={beta_btc:.3f}\nbeta_eth={beta_eth:.3f}\n"
+            f"ratio_btc_change_30={ratio_btc_change:.3f}\n"
+            f"ratio_eth_change_30={ratio_eth_change:.3f}\n"
+            "Return exactly 3 short bullets."
+        )
+        try:
+            ai_text = chat_completion(
+                endpoint=CFG.analyzer_endpoint,
+                api_key=api_key_1,
+                model=model_1,
+                messages=[{"role":"system","content":DEP_SYSTEM},
+                          {"role":"user","content":hints}],
+                timeout=18
+            )
+        except Exception:
+            ai_text = None
+
+    if not ai_text:
+        ai_text = _heuristic_dep_bullets(
+            symbol, corr_btc_30, corr_eth_30, corr_btc_90, corr_eth_90, beta_btc, beta_eth,
+            ratio_btc_change, ratio_eth_change
+        )
+
+    def fmt(x, d=3):
+        try: return f"{float(x):.{d}f}"
+        except: return "-"
+
+    md = []
+    md.append(f"🔗 *Залежність BTC/ETH для* `{symbol}` *(TF={timeframe})*")
+    md.append("")
+    md.append(f"- ρ BTC (30/90): `{fmt(corr_btc_30)}` / `{fmt(corr_btc_90)}`")
+    md.append(f"- ρ ETH (30/90): `{fmt(corr_eth_30)}` / `{fmt(corr_eth_90)}`")
+    md.append(f"- β до BTC/ETH: `{fmt(beta_btc)}` / `{fmt(beta_eth)}`")
+    md.append(f"- Δ Ratio vs BTC (30): `{fmt(ratio_btc_change*100,2)}%`")
+    md.append(f"- Δ Ratio vs ETH (30): `{fmt(ratio_eth_change*100,2)}%`")
+    md.append("")
+    md.append("🧠 *Коментар*:")
+    md.append((ai_text or "-").strip()[:1200])
+    return "\n".join(md)
+
+async def on_cb_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = (q.data or "")
+    if not data.startswith("dep:"): return
+    sym = data.split(":",1)[1].upper()
+    await _send(update, context, f"⏳ Рахую залежність BTC/ETH для {sym}…")
+    try:
+        report = await _dependency_report(sym, CFG.analyze_timeframe, limit=300)
+        await _send(update, context, report, parse_mode="Markdown")
+    except Exception as e:
+        log.exception("dep failed")
+        await _send(update, context, f"⚠️ dep error: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CALLBACK: ai:<SYM>
+# ──────────────────────────────────────────────────────────────────────────────
+async def on_cb_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        q = update.callback_query
+        await q.answer()
+        data = (q.data or "")
+        if not data.startswith("ai:"): return
+        symbol = data.split(":",1)[1].strip().upper()
+        await ai(update, context, symbol_arg=symbol, timeframe_arg=CFG.analyze_timeframe)
+    except Exception as e:
+        log.exception("on_cb_ai failed")
+        await _send(update, context, f"⚠️ callback error: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /req — залежність як окрема команда
+# ──────────────────────────────────────────────────────────────────────────────
+async def req(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    symbol = (args[0] if args else _pick_default_symbol()).upper()
+    tf = (args[1] if len(args) > 1 else CFG.analyze_timeframe)
+    if not _looks_like_symbol(symbol):
+        await _send(update, context, "⚠️ Невірний символ. Приклад: `/req ADAUSDT 1h`")
+        return
+    await _send(update, context, f"⏳ Рахую залежність BTC/ETH для {symbol}…")
+    try:
+        report = await _dependency_report(symbol, tf, limit=300)
+        await _send(update, context, report, parse_mode="Markdown")
+    except Exception as e:
+        log.exception("/req failed")
+        await _send(update, context, f"⚠️ req error: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# register
+# ──────────────────────────────────────────────────────────────────────────────
+def register_handlers(app: Application):
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("guide", guide))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("top", top))
+    app.add_handler(CommandHandler("analyze", analyze))
+    app.add_handler(CommandHandler("ai", ai))
+    app.add_handler(CommandHandler("req", req))
+    app.add_handler(CommandHandler("news", news))
+
+    app.add_handler(CallbackQueryHandler(on_cb_sym,     pattern=r"^sym:[A-Z0-9]+$"))
+    app.add_handler(CallbackQueryHandler(on_cb_ai,      pattern=r"^ai:[A-Z0-9]+$"))
+    app.add_handler(CallbackQueryHandler(on_cb_dep,     pattern=r"^dep:[A-Z0-9]+$"))
+    app.add_handler(CallbackQueryHandler(on_cb_topmode, pattern=r"^topmode:(volume|gainers)$"))

@@ -1,42 +1,68 @@
 # telegram_bot/bot.py
 from __future__ import annotations
-import logging, os, sys
+import logging, os
+from typing import Optional
 
-# щоб імпортувати пакет від кореня проекту
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from telegram.ext import Application
+from core_config import CFG
+from telegram_bot.handlers import register_handlers
 
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler
-
-from core_config import TELEGRAM_BOT_TOKEN
-from telegram_bot.handlers import (
-    start, help_cmd, ping, analyze, top, ai, news, guide, on_cb_detail
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
 log = logging.getLogger("tg.bot")
 
-def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+# ---- error handler (глобальний) ---------------------------------------------
+async def on_error(update, context):
+    log.exception("Unhandled error", exc_info=context.error)
+    try:
+        chat = update.effective_chat if update else None
+        if chat:
+            await context.bot.send_message(chat.id, "⚠️ Виникла помилка. Уже чиню.")
+    except Exception:
+        pass
 
-    # Команди
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("top", top))
-    app.add_handler(CommandHandler("analyze", analyze))
-    app.add_handler(CommandHandler("ai", ai))
-    app.add_handler(CommandHandler("news", news))      # опційно
-    app.add_handler(CommandHandler("guide", guide))    # ← НОВЕ: інструкція
+# ---- побудова застосунку ----------------------------------------------------
+def _build_app(token: Optional[str] = None) -> Application:
+    token = token or getattr(CFG, "telegram_bot_token", None) or os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in CFG or ENV")
 
-    # Callback‑кнопки (на майбутнє)
-    app.add_handler(CallbackQueryHandler(on_cb_detail, pattern=r"^detail:"))
+    app = Application.builder().token(token).build()
+    register_handlers(app)
+    app.add_error_handler(on_error)
+    return app
 
-    log.info("🤖 Running bot…")
-    # Якщо десь уже крутиться APScheduler — тут нічого додатково не запускаємо.
-    app.run_polling(close_loop=False, allowed_updates=["message", "callback_query"])
+# ---- запуск (синхронний, без asyncio.run) -----------------------------------
+def run():
+    """
+    Підтримує два режими:
+      - polling (локалка)
+      - webhook (прод)
+    """
+    app = _build_app()
 
-if __name__ == "__main__":
-    main()
+    mode = (getattr(CFG, "bot_mode", None) or os.getenv("BOT_MODE") or "polling").lower()
+    tz = getattr(CFG, "tz_name", "UTC")
+    log.info("Starting bot in %s mode (TZ=%s)", mode, tz)
+
+    if mode == "webhook":
+        webhook_url = getattr(CFG, "webhook_url", None) or os.getenv("WEBHOOK_URL")
+        port = int(getattr(CFG, "port", 8080) or os.getenv("PORT") or 8080)
+        listen = "0.0.0.0"
+
+        if not webhook_url:
+            raise RuntimeError("WEBHOOK_URL must be set for webhook mode")
+
+        # PTB 21: синхронний блокуючий виклик
+        app.run_webhook(
+            listen=listen,
+            port=port,
+            url_path="",
+            webhook_url=webhook_url,
+            allowed_updates=None,
+            drop_pending_updates=True,
+        )
+    else:
+        # PTB 21: синхронний блокуючий виклик
+        app.run_polling(
+            allowed_updates=None,
+            drop_pending_updates=True,
+        )

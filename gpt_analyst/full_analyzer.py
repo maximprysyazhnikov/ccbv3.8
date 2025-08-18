@@ -1,77 +1,55 @@
-import pandas as pd
-from market_data.klines import get_klines
-from utils.indicators import compute_indicators
-from utils.news import get_latest_news
-from core_config import ANALYZE_BARS, DEFAULT_TIMEFRAME, COMPACT_MODE
+from __future__ import annotations
+from typing import List
+from core_config import CFG
+from router.analyzer_router import pick_route
+from utils.openrouter import chat_completion
+from utils.formatting import save_report
+from market_data.candles import get_ohlcv
+from market_data.orderbook import get_orderbook_summary
+from market_data.news import fetch_recent_news
 
+PROMPT = """You are a crypto market analyst.
+Given OHLCV candles, orderbook summary and recent news, produce a compact Markdown trade brief:
 
-def run_full_analysis(symbol: str, timeframe: str = None) -> list[str]:
-    """
-    Повний аналіз ринку: тягнемо дані з Binance, рахуємо індикатори, додаємо новини,
-    формуємо Markdown-звіт (у компактному або розширеному вигляді).
-    """
-    tf = timeframe or DEFAULT_TIMEFRAME
+- Direction: LONG/SHORT/NO_TRADE
+- Confidence: 0..100%
+- Entry: number
+- Stop: number
+- Take: number
+- Reasoning: up to 5 concise bullets (mix tech+orderbook+news)
 
-    # 1. Отримати дані по свічках
-    df = get_klines(symbol, interval=tf, limit=ANALYZE_BARS)
-    if df is None or df.empty:
-        return [f"⚠️ Немає даних по {symbol} ({tf})"]
+If NO_TRADE, explain briefly. Keep it crisp.
 
-    # 2. Рахуємо індикатори
-    df = compute_indicators(df)
+Data:
+Symbol: {symbol}
+Timeframe: {tf}, Bars: {bars}
+OHLCV: {ohlcv}
+OrderBook: {orderbook}
+News: {news}
+"""
 
-    # 3. Новини (якщо є)
-    news_items = get_latest_news(symbol)
+def run_full_analysis(symbol: str, timeframe: str, bars: int) -> List[str]:
+    route = pick_route(symbol)
+    if not route:
+        return [f"❌ No route for {symbol} (no API key/model)"]
 
-    # 4. Формування звіту
-    if COMPACT_MODE:
-        # Відправляємо GPT тільки таблицю з індикаторами
-        md_report = _make_compact_report(symbol, tf, df, news_items)
-    else:
-        # Повний звіт з секціями
-        md_report = _make_full_report(symbol, tf, df, news_items)
+    ohlcv = get_ohlcv(symbol, timeframe, min(bars, CFG.analyze_limit))
+    orderbook = get_orderbook_summary(symbol)
+    news = fetch_recent_news(symbol, max_items=5)
 
-    return md_report
+    prompt = PROMPT.format(
+        symbol=symbol, tf=timeframe, bars=len(ohlcv),
+        ohlcv=ohlcv, orderbook=orderbook, news=news
+    )
 
+    text = chat_completion(
+        endpoint=CFG.analyzer_endpoint,
+        api_key=route.api_key,
+        model=route.model,
+        messages=[{"role": "user", "content": prompt}],
+        timeout=30
+    )
 
-def _make_compact_report(symbol: str, tf: str, df: pd.DataFrame, news_items: list) -> list[str]:
-    """Компактний режим: тільки таблиця індикаторів + короткі новини"""
-    table = df.tail(ANALYZE_BARS).to_markdown(index=False)
-
-    lines = [f"### 📊 Technical Indicators for {symbol} (TF={tf}, last {ANALYZE_BARS} bars)"]
-    lines.append(table)
-
-    if news_items:
-        lines.append("\n### 📰 Latest News")
-        for n in news_items:
-            lines.append(f"- [{n['title']}]({n['link']})")
-
-    return lines
-
-
-def _make_full_report(symbol: str, tf: str, df: pd.DataFrame, news_items: list) -> list[str]:
-    """Розширений режим: Markdown з секціями"""
-    last_row = df.iloc[-1].to_dict()
-
-    lines = [
-        f"# 📈 Market Analysis Report",
-        f"**Symbol:** {symbol}",
-        f"**Timeframe:** {tf}",
-        f"**Bars analyzed:** {ANALYZE_BARS}",
-        "",
-        "## 🔹 Latest Candle",
-        f"- Close: {last_row.get('close')}",
-        f"- Volume: {last_row.get('volume')}",
-        "",
-        "## 🔹 Indicators Table (last bars)",
-        df.tail(ANALYZE_BARS).to_markdown(index=False),
-    ]
-
-    if news_items:
-        lines.append("\n## 📰 Latest News")
-        for n in news_items:
-            lines.append(f"- [{n['title']}]({n['link']})")
-
-    lines.append("\n---\n🤖 *Generated automatically by AI Analyst*")
-
+    lines = [line for line in text.splitlines()]
+    save_report(symbol, lines)
     return lines
