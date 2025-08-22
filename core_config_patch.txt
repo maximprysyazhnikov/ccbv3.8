@@ -1,0 +1,13 @@
+# Псевдо‑патч core_config.py
+# Додай до CFG прапорці з .env:
+
+# import os
+# V3_FEATURES = os.getenv("V3_FEATURES", "false").lower() == "true"
+# V3_ENABLE_STATS = os.getenv("V3_ENABLE_STATS", "false").lower() == "true"
+# V3_ENABLE_TRADER = os.getenv("V3_ENABLE_TRADER", "false").lower() == "true"
+
+# CFG.update({
+#   "v3_features": V3_FEATURES,
+#   "v3_enable_stats": V3_ENABLE_STATS,
+#   "v3_enable_trader": V3_ENABLE_TRADER,
+# })

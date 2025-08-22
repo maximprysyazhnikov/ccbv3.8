@@ -1,0 +1,16 @@
+# Pсевдо‑патч для telegram_bot/handlers.py
+
+# 1) Імпорт CFG з core_config.py і прапорів:
+# from core_config import CFG
+# V3 = CFG.get("v3_features", False)
+# V3_STATS = CFG.get("v3_enable_stats", False)
+# V3_TRADER = CFG.get("v3_enable_trader", False)
+
+# 2) Реєстрація команд v3 лише коли дозволено:
+# if V3 and V3_STATS:
+#     app.add_handler(CommandHandler("stats", stats_handler))
+#     app.add_handler(CommandHandler("modelrank", modelrank_handler))
+# if V3 and V3_TRADER:
+#     app.add_handler(CommandHandler("orders", orders_handler))
+
+# 3) У відповідях /help та /panel — показувати/ховати кнопки залежно від прапорів.

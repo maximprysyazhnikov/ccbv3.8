@@ -1,44 +1,60 @@
+# market_data/orderbook.py
 from __future__ import annotations
-import requests
-from typing import Any, Dict, List, Tuple
+import requests, time
+from typing import Dict
 
-BINANCE_DEPTH = "https://api.binance.com/api/v3/depth"
+BINANCE_BASE = "https://api.binance.com"
 
+def _get(path: str, params: dict | None = None, retries: int = 2, timeout: int = 10):
+    url = f"{BINANCE_BASE}{path}"
+    last = None
+    for i in range(retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                time.sleep(0.5 + 0.5*i)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(0.3 + 0.3*i)
+    raise RuntimeError(f"orderbook fetch failed: {last}")
 
-def get_orderbook_summary(symbol: str, limit: int = 50) -> Dict[str, Any]:
-    params = {"symbol": symbol.upper(), "limit": min(max(limit, 5), 5000)}
-    r = requests.get(BINANCE_DEPTH, params=params, timeout=10)
-    r.raise_for_status()
-    j = r.json()
+def get_orderbook_stats(symbol: str, limit: int = 50) -> Dict[str, float]:
+    symbol = (symbol or "").upper().strip()
+    if symbol.endswith(":USDT"):
+        symbol = symbol.replace(":USDT", "USDT")
+    ob = _get("/api/v3/depth", {"symbol": symbol, "limit": min(max(int(limit), 5), 1000)})
 
-    bids: List[Tuple[float, float]] = [(float(p), float(q)) for p, q in j.get("bids", [])]
-    asks: List[Tuple[float, float]] = [(float(p), float(q)) for p, q in j.get("asks", [])]
+    def _best(lst, side: str):
+        if not lst: return (float("nan"), float("nan"))
+        # [price, qty] як строки
+        p = float(lst[0][0]); q = float(lst[0][1])
+        return p, q
 
-    top_bid = bids[0][0] if bids else None
-    top_ask = asks[0][0] if asks else None
+    bids = ob.get("bids", [])  # найвища ціна
+    asks = ob.get("asks", [])  # найнижча ціна
 
-    def wall(levels):
-        return max(levels[:limit], key=lambda x: x[1])[0] if levels else None
-
-    bid_wall = wall(bids)
-    ask_wall = wall(asks)
-
-    bid_vol = sum(q for _, q in bids[:limit])
-    ask_vol = sum(q for _, q in asks[:limit])
-
-    if bid_vol > ask_vol * 1.2:
-        imbalance = "BUY_DOMINANT"
-    elif ask_vol > bid_vol * 1.2:
-        imbalance = "SELL_DOMINANT"
-    else:
-        imbalance = "BALANCED"
+    best_bid, bid_qty = _best(bids, "bid")
+    best_ask, ask_qty = _best(asks, "ask")
+    if not (best_bid == best_bid and best_ask == best_ask):  # NaN check
+        return {"mid": float("nan"), "spread_bps": float("nan"),
+                "imbalance_pct": float("nan"), "nearest_bid_wall": float("nan"),
+                "nearest_ask_wall": float("nan")}
+    mid = (best_bid + best_ask) / 2.0
+    spread_bps = (best_ask - best_bid) / mid * 10_000 if mid > 0 else float("nan")
+    # найпростіша “стінка” — найбільший обсяг серед перших N
+    nb = max((float(q) for _, q in bids[:limit]), default=float("nan"))
+    na = max((float(q) for _, q in asks[:limit]), default=float("nan"))
+    total_b = sum(float(q) for _, q in bids[:limit]) or 1.0
+    total_a = sum(float(q) for _, q in asks[:limit]) or 1.0
+    imbalance = (total_b - total_a) / (total_b + total_a) * 100.0
 
     return {
-        "top_bid": top_bid,
-        "top_ask": top_ask,
-        "bid_wall": bid_wall,
-        "ask_wall": ask_wall,
-        "imbalance": imbalance,
-        "bid_vol_topN": bid_vol,
-        "ask_vol_topN": ask_vol,
+        "mid": mid,
+        "spread_bps": spread_bps,
+        "imbalance_pct": imbalance,
+        "nearest_bid_wall": nb,
+        "nearest_ask_wall": na,
     }
