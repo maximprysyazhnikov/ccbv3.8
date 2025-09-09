@@ -1,0 +1,19 @@
+*** Begin Patch
+*** Update File: services/gpt_analyst/full_analyzer.py
+@@
+- def run_full_analysis(symbol: str, tf: str, locale: str = "uk"):
++from typing import Optional
++
++def run_full_analysis(
++    symbol: str,
++    tf: str,
++    route: Optional[str] = None,
++    locale: str = "uk",
++    **_: object,
++):
+     """
+     Повертає список блоків (рядків) красивого Markdown-звіту.
+     """
+     # ... ваш існуючий код без змін ...
+
+*** End Patch
