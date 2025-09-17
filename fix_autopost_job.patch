@@ -1,0 +1,68 @@
+** *Begin
+Patch
+** *Update
+File: main.py
+
+
+@ @
+
+
+-  # десь вище у тебе створюється APScheduler і додається job:
+-  # scheduler.add_job(autopost_scan, "interval", seconds=300)
++  # ❗ Рекомендується винести автопост на PTB JobQueue, бо функція async.
+
++
+from telegram.ext import Application
+
++
+from telegram import constants
+
++
+from core_config import CFG
+
++
+from services.autopost import run_autopost_once
+
++
+import asyncio
+
++
+import logging
+
++log = logging.getLogger("app")
++
++  # ... після створення `application = Application.builder()...build()`
++
++
+
+
+async def autopost_scan(context):
+    +
+    try:
+        +        res = await run_autopost_once(None)
+
+
++
+if not res:
+    +
+    return
++        chat_id = CFG.get("CHAT_ID") or CFG.get("TELEGRAM_CHAT_ID")
++
+for m in res:
+    +            text = m if isinstance(m, str) else m.get("text", "")
++
+if not text:
+    +
+    continue
++            await context.bot.send_message(
+    +                chat_id = chat_id,
++                text = text,
++                parse_mode = constants.ParseMode.HTML
+                              +            )
++    except Exception:
++        log.warning("autopost_scan failed", exc_info=True)
++
++  # Замість APScheduler для цієї задачі:
++application.job_queue.run_repeating(autopost_scan, interval=300, first=10)
+** *End
+Patch

@@ -1,194 +1,261 @@
 # services/daily_tracker.py
 from __future__ import annotations
-import os, sqlite3, time
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
-DB_PATH = os.getenv("DB_PATH", "storage/app.db")
+import os
+import sqlite3
+import logging
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
+from typing import List, Optional, Tuple
+
+log = logging.getLogger("daily_tracker")
+
+DB_PATH = os.getenv("DB_PATH") or os.getenv("SQLITE_PATH") or os.getenv("DATABASE_PATH") or "storage/bot.db"
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Kyiv"))
 
-# ─────────────── DB helpers ───────────────
+# ---------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------
 def _conn() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.row_factory = sqlite3.Row
+    return c
 
-def _fmt_money(x: float) -> str:
-    sign = "➕" if x >= 0 else "➖"
-    return f"{sign} ${abs(x):.2f}"
+def _get_setting(key: str, default: str) -> str:
+    try:
+        with _conn() as c:
+            cur = c.cursor()
+            cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return str(row[0])
+    except Exception as e:
+        log.debug("get_setting(%s) failed: %s", key, e)
+    # .env fallback
+    env_val = os.getenv(key.upper())
+    return env_val if env_val is not None else default
 
+# ---------------------------------------------------------------------
+# Domain
+# ---------------------------------------------------------------------
 @dataclass
-class Trade:
-    id: int
-    user_id: int
+class TradeRow:
     symbol: str
-    tf: str
-    direction: str  # LONG/SHORT
-    entry: float
-    sl: float
-    tp: float
-    rr: float
-    status: str     # WIN/LOSS/OPEN/...
-    pnl_pct: Optional[float]
+    timeframe: Optional[str]
+    status: str
+    pnl: Optional[float]
+    rr: Optional[float]
+    closed_at: Optional[str]
 
-# ─────────────── core calc ───────────────
-def _calc_pct(t: Trade) -> float:
-    """PnL% для закритої угоди. Якщо pnl_pct є в БД — беремо його."""
-    if t.pnl_pct is not None:
-        return float(t.pnl_pct)
-    if t.status == "WIN":
-        if t.direction == "LONG":
-            return (t.tp / t.entry - 1.0) * 100.0
-        else:
-            return (1.0 - t.tp / t.entry) * 100.0
-    if t.status == "LOSS":
-        if t.direction == "LONG":
-            return (t.sl / t.entry - 1.0) * 100.0
-        else:
-            return (1.0 - t.sl / t.entry) * 100.0
-    return 0.0
+def _bounds_for_day_kyiv(dt: datetime) -> Tuple[str, str, str]:
+    """(label_date, start_iso, end_iso) для конкретної дати в Europe/Kyiv."""
+    start = datetime.combine(dt.date(), time(0, 0, 0), tzinfo=TZ)
+    end = start + timedelta(days=1)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return (dt.date().isoformat(), start.strftime(fmt), end.strftime(fmt))
 
-def _usd(pct: float, stake: float = 100.0) -> float:
-    return round(stake * pct / 100.0, 2)
+def _bounds_for_range_days(period_days: int) -> Tuple[str, str]:
+    """(start_iso, end_iso) для інтервалу [now - period_days, now) у Europe/Kyiv."""
+    now = datetime.now(TZ)
+    start = now - timedelta(days=int(period_days))
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return (start.strftime(fmt), now.strftime(fmt))
 
-# ─────────────── public API ───────────────
-def compute_daily_summary(
-    user_id: int,
-    day_ymd: Optional[Tuple[int, int, int]] = None,
-    rr_min: Optional[float] = None,
-) -> Tuple[dict, str]:
-    """
-    Повертає (metrics, markdown) для денного P&L користувача з фільтром RR≥rr_min.
-    metrics: {'trades','wins','losses','winrate','sum_usd','avg_usd','avg_pct'}
-    """
-    # межі дня у локальному TZ
-    if day_ymd:
-        y, m, d = day_ymd
-        t0 = int(time.mktime(time.strptime(f"{y:04d}-{m:02d}-{d:02d} 00:00:00", "%Y-%m-%d %H:%M:%S")))
-    else:
-        lt = time.localtime()
-        t0 = int(time.mktime(time.strptime(time.strftime("%Y-%m-%d 00:00:00", lt), "%Y-%m-%d %H:%M:%S")))
-    t1 = t0 + 86400 - 1
-
-    with _conn() as conn:
-        cur = conn.cursor()
-        if rr_min is None:
-            try:
-                cur.execute("SELECT COALESCE(daily_rr,3.0) FROM user_settings WHERE user_id=?", (user_id,))
-                row = cur.fetchone()
-                rr_min = float(row[0] if row else 3.0)
-            except sqlite3.OperationalError:
-                rr_min = 3.0
-
+def _fetch_trades_closed_between(start_iso: str, end_iso: str) -> List[TradeRow]:
+    rows: List[TradeRow] = []
+    with _conn() as c:
+        cur = c.cursor()
+        # основний шлях: фільтруємо по closed_at
         cur.execute(
             """
-            SELECT id,user_id,symbol,tf,direction,entry,sl,tp,rr,status,pnl_pct
-            FROM signals
-            WHERE user_id=? AND status IN('WIN','LOSS')
-              AND COALESCE(rr,0) >= ?
-              AND COALESCE(ts_closed, ts_created) BETWEEN ? AND ?
-            ORDER BY COALESCE(ts_closed, ts_created) ASC
+            SELECT symbol, timeframe, status, pnl, rr, closed_at
+            FROM trades
+            WHERE status IN ('WIN','LOSS')
+              AND closed_at IS NOT NULL
+              AND closed_at >= ? AND closed_at < ?
+            ORDER BY closed_at ASC
             """,
-            (user_id, rr_min, t0, t1),
+            (start_iso, end_iso),
         )
-        rows = cur.fetchall()
+        for r in cur.fetchall() or []:
+            rows.append(
+                TradeRow(
+                    symbol=r["symbol"],
+                    timeframe=r["timeframe"],
+                    status=r["status"],
+                    pnl=(float(r["pnl"]) if r["pnl"] is not None else None),
+                    rr=(float(r["rr"]) if r["rr"] is not None else None),
+                    closed_at=r["closed_at"],
+                )
+            )
 
-    trades: List[Trade] = [
-        Trade(
-            id=int(r["id"]),
-            user_id=int(r["user_id"]),
-            symbol=str(r["symbol"]),
-            tf=str(r["tf"]),
-            direction=str(r["direction"]),
-            entry=float(r["entry"]),
-            sl=float(r["sl"]),
-            tp=float(r["tp"]),
-            rr=float(r["rr"]),
-            status=str(r["status"]),
-            pnl_pct=(None if r["pnl_pct"] is None else float(r["pnl_pct"])),
-        )
-        for r in rows
-    ]
+        # fallback: якщо закриття не логуються у closed_at — пробуємо opened_at
+        if not rows:
+            try:
+                cur.execute(
+                    """
+                    SELECT symbol, timeframe, status, pnl, rr, opened_at as closed_at
+                    FROM trades
+                    WHERE status IN ('WIN','LOSS')
+                      AND opened_at IS NOT NULL
+                      AND opened_at >= ? AND opened_at < ?
+                    ORDER BY opened_at ASC
+                    """,
+                    (start_iso, end_iso),
+                )
+                for r in cur.fetchall() or []:
+                    rows.append(
+                        TradeRow(
+                            symbol=r["symbol"],
+                            timeframe=r["timeframe"],
+                            status=r["status"],
+                            pnl=(float(r["pnl"]) if r["pnl"] is not None else None),
+                            rr=(float(r["rr"]) if r["rr"] is not None else None),
+                            closed_at=r["closed_at"],
+                        )
+                    )
+            except Exception as e:
+                log.debug("daily_tracker fallback by opened_at failed: %s", e)
+    return rows
 
-    wins = sum(1 for t in trades if t.status == "WIN")
-    losses = sum(1 for t in trades if t.status == "LOSS")
-    n = len(trades)
-    winrate = round(100.0 * wins / n, 2) if n else 0.0
-
-    total_usd = 0.0
-    total_pct = 0.0
-    lines = []
-
-    for t in trades:
-        pct = _calc_pct(t)
-        usd = _usd(pct, 100.0)
-        total_usd += usd
-        total_pct += pct
-        lines.append(f"{t.symbol} {t.tf:<4}  {pct:>6.2f}%   {usd:>8.2f}")
-
-    avg_usd = round(total_usd / n, 2) if n else 0.0
-    avg_pct = round(total_pct / n, 2) if n else 0.0
-
-    day_str = datetime.fromtimestamp(t0, TZ).strftime("%Y-%m-%d")
-    md_lines = [
-        f"**📅 Daily P&L — {day_str} (RR≥{rr_min:g}, $100/угода)**",
-        "",
-        f"Угод: **{n}** | WIN: **{wins}** | LOSS: **{losses}** | Winrate: **{winrate:.2f}%**",
-        f"Разом: **{_fmt_money(total_usd)}** | Середнє/угода: **{_fmt_money(avg_usd)}** (~{avg_pct:.2f}%)",
-    ]
-    if lines:
-        md_lines += ["", "```", "Pair/TF        PnL%      PnL($)", "--------------------------------", *lines, "```"]
-    md = "\n".join(md_lines)
-
-    metrics = {
-        "trades": n,
-        "wins": wins,
-        "losses": losses,
-        "winrate": winrate,
-        "sum_usd": round(total_usd, 2),
-        "avg_usd": avg_usd,
-        "avg_pct": avg_pct,
-    }
-    return metrics, md
-
-# ─────────────── PTB jobs / test commands ───────────────
-async def daily_tracker_job(context) -> None:
-    """
-    JobQueue callback: шле щоденний звіт усім користувачам, у кого daily_tracker=1.
-    """
-    bot = getattr(context, "bot", None) or getattr(getattr(context, "application", None), "bot", None)
-    if bot is None and getattr(context, "job", None) and context.job.data:
-        bot = context.job.data.get("bot")
-
-    # беремо список користувачів з увімкненим трекером
-    with _conn() as conn:
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT user_id, COALESCE(daily_rr,3.0) as daily_rr FROM user_settings WHERE COALESCE(daily_tracker,0)=1")
-            users = cur.fetchall()
-        except sqlite3.OperationalError:
-            users = []
-
-    for r in users:
-        uid = int(r["user_id"])
-        rr_min = float(r["daily_rr"])
-        try:
-            _, md = compute_daily_summary(uid, rr_min=rr_min)
-            if bot:
-                await bot.send_message(chat_id=uid, text=md, parse_mode="Markdown")
-        except Exception as e:
-            if bot:
-                await bot.send_message(chat_id=uid, text=f"⚠️ Daily tracker помилка: {e}")
-
-# утилітна команда для миттєвого тесту з чату
-async def daily_now(bot, chat_id: int) -> None:
+def _fmt_f(v: Optional[float], digits: int = 2, dash: str = "0.00") -> str:
     try:
-        # day_ymd=None → сьогодні
-        uid = chat_id  # один-до-одного для приватного чату
-        _, md = compute_daily_summary(uid)
-        await bot.send_message(chat_id=chat_id, text=md, parse_mode="Markdown")
+        if v is None:
+            return dash
+        return f"{float(v):.{digits}f}"
+    except Exception:
+        return dash
+
+def _fmt_rr(v: Optional[float]) -> str:
+    try:
+        if v is None:
+            return "-"
+        return f"{float(v):.2f}"
+    except Exception:
+        return "-"
+
+# ---------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------
+def compute_daily_summary(*_args, **_kwargs) -> str:
+    """
+    Текст для /daily_now: лише закриті угоди за сьогодні (Europe/Kyiv).
+    Приймає ігноровані *args/**kwargs, щоб бути толерантною до хендлерів.
+    """
+    date_str, start_iso, end_iso = _bounds_for_day_kyiv(datetime.now(TZ))
+    trades = _fetch_trades_closed_between(start_iso, end_iso)
+
+    total = len(trades)
+    wins = sum(1 for t in trades if (t.status or "").upper() == "WIN")
+    losses = sum(1 for t in trades if (t.status or "").upper() == "LOSS")
+    wr = (wins / total * 100.0) if total else 0.0
+
+    rr_vals = [t.rr for t in trades if isinstance(t.rr, (int, float))]
+    pnl_vals = [t.pnl for t in trades if isinstance(t.pnl, (int, float))]
+    avg_rr = (sum(rr_vals) / len(rr_vals)) if rr_vals else 0.0
+    sum_pnl = sum(pnl_vals) if pnl_vals else 0.0
+    avg_pnl = (sum(pnl_vals) / len(pnl_vals)) if pnl_vals else 0.0
+
+    lines: List[str] = []
+    for t in trades[:20]:
+        tf = t.timeframe or "-"
+        pnl_s = _fmt_f(t.pnl, 2, dash="-")
+        rr_s = _fmt_rr(t.rr)
+        lines.append(f"• {t.symbol} [{tf}] {t.status} | PnL: {pnl_s} | RR: {rr_s}")
+    details = "\n".join(lines) if lines else "—"
+
+    text = (
+        f"📆 Daily P&L — {date_str} (TZ: Europe/Kyiv)\n"
+        f"Closed trades: {total} | WIN: {wins} | LOSS: {losses} | Winrate: {wr:.2f}%\n"
+        f"Sum PnL$: {_fmt_f(sum_pnl, 2)} | Avg RR: {_fmt_rr(avg_rr)} | Avg PnL$: {_fmt_f(avg_pnl, 2)}\n"
+        f"\n{details}"
+    )
+    return text
+
+def compute_kpis(*_args, period_days: int = None, rr_bucket: float = None, **_kwargs) -> str:
+    def compute_kpi(*args, **kwargs):
+        return compute_kpis(*args, **kwargs)
+
+    def get_kpi(*args, **kwargs):
+        return compute_kpis(*args, **kwargs)
+
+    def get_kpis(*args, **kwargs):
+        return compute_kpis(*args, **kwargs)
+    """
+    
+    KPI з панелі/команди /kpi.
+    - період: останні N днів (за замовчуванням 7)
+    - bucket RR: поріг для блоку RR≥X (за замовчуванням береться з settings.kpi_rr_bucket або 2)
+    Повертає готовий текст.
+    """
+    # параметри з settings/env
+    if period_days is None:
+        try:
+            period_days = int(os.getenv("KPI_DAYS", "7"))
+        except Exception:
+            period_days = 7
+    if rr_bucket is None:
+        try:
+            rr_bucket = float(_get_setting("kpi_rr_bucket", os.getenv("KPI_RR_BUCKET", "2")))
+        except Exception:
+            rr_bucket = 2.0
+
+    start_iso, end_iso = _bounds_for_range_days(period_days)
+    trades = _fetch_trades_closed_between(start_iso, end_iso)
+
+    total = len(trades)
+    wins = sum(1 for t in trades if (t.status or "").upper() == "WIN")
+    losses = sum(1 for t in trades if (t.status or "").upper() == "LOSS")
+    wr = (wins / total * 100.0) if total else 0.0
+
+    rr_vals = [t.rr for t in trades if isinstance(t.rr, (int, float))]
+    pnl_vals = [t.pnl for t in trades if isinstance(t.pnl, (int, float))]
+    avg_rr = (sum(rr_vals) / len(rr_vals)) if rr_vals else 0.0
+    sum_pnl = sum(pnl_vals) if pnl_vals else 0.0
+
+    # RR bucket
+    rr_bucket_vals = [t for t in trades if isinstance(t.rr, (int, float)) and t.rr >= rr_bucket]
+    rr_bucket_cnt = len(rr_bucket_vals)
+    rr_bucket_pnl = sum((t.pnl or 0.0) for t in rr_bucket_vals)
+
+    # Топ символів по кількості угод (до 5)
+    from collections import Counter
+    sym_counter = Counter([t.symbol for t in trades])
+    top_syms = ", ".join(f"{s}:{n}" for s, n in sym_counter.most_common(5)) if sym_counter else "—"
+
+    text = (
+        f"📊 KPI last {period_days}d (TZ: Europe/Kyiv)\n"
+        f"TRD: {total} | WR%: {wr:.2f} | PNL$: {_fmt_f(sum_pnl, 2)} | AVG_RR: {_fmt_rr(avg_rr)}\n"
+        f"RR≥{rr_bucket:g}: CNT={rr_bucket_cnt} | PNL_RR≥{rr_bucket:g}$: {_fmt_f(rr_bucket_pnl, 2)}\n"
+        f"Top symbols: {top_syms}"
+    )
+    return text
+
+async def daily_tracker_job(bot) -> None:
+    """
+    Джоб для щоденної розсилки в 23:59 (налаштовано в main.py).
+    Відправляє summary тим, у кого daily_tracker=1.
+    """
+    try:
+        text = compute_daily_summary()
     except Exception as e:
-        await bot.send_message(chat_id=chat_id, text=f"⚠️ daily_now error: {e}")
+        log.warning("daily_tracker: compute failed: %s", e)
+        text = f"⚠️ daily summary failed: {e}"
+
+    # розсилка
+    try:
+        with _conn() as c:
+            cur = c.cursor()
+            cur.execute("SELECT user_id FROM user_settings WHERE COALESCE(daily_tracker,0)=1")
+            user_ids = [int(r[0]) for r in cur.fetchall() or []]
+    except Exception as e:
+        log.warning("daily_tracker: fetch users failed: %s", e)
+        user_ids = []
+
+    for uid in user_ids:
+        try:
+            await bot.send_message(chat_id=uid, text=text, disable_web_page_preview=True)
+        except Exception as e:
+            log.warning("daily_tracker: send to %s failed: %s", uid, e)

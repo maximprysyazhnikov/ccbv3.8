@@ -2,7 +2,7 @@
 from __future__ import annotations
 from typing import List
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-
+from telegram_bot import panel_neutral
 from core_config import CFG
 from utils.user_settings import get_user_settings, set_user_settings, ensure_user_row
 
@@ -52,6 +52,12 @@ def panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
             callback_data=f"panel:toggle_autopost:{1 if not autopost else 0}"
         )
     ])
+
+    rows.append([
+        InlineKeyboardButton("⚙️ Neutral", callback_data="panel:neutral"),
+        InlineKeyboardButton("📊 KPI", callback_data="panel:kpi"),
+    ])
+    keyboard = InlineKeyboardMarkup(rows)
 
     # Timeframe
     rows.append([InlineKeyboardButton(_mark(tf, timeframe), callback_data=f"panel:set_tf:{tf}") for tf in TF_OPTIONS])

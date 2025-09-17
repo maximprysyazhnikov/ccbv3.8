@@ -1,13 +1,7 @@
 # utils/openrouter.py
 from __future__ import annotations
-import os
-import json
-import time
-import math
-import random
-import itertools
+import os, json, time, random, itertools
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-
 import httpx
 from core_config import CFG
 
@@ -89,7 +83,8 @@ def _build_slots_from_env_and_cfg() -> List[Tuple[str, str, str, float]]:
     """
     Priority:
     1) CFG['or_slots'] = [{"key":..,"model":..,"base"?, "timeout"?}, ...]
-    2) ENV: OPENROUTER_KEYS=key1,key2 ; OPENROUTER_MODEL=mdl1[,mdl2,...]
+    2) ENV: OR_SLOTS='[{"key":...,"model":...,"base":...,"timeout":...}, ...]'
+    3) ENV: OPENROUTER_KEYS=key1,key2 ; OPENROUTER_MODEL=mdl1[,mdl2,...]
     """
     slots: List[Any] = []
 
@@ -97,7 +92,17 @@ def _build_slots_from_env_and_cfg() -> List[Tuple[str, str, str, float]]:
     for s in (CFG.get("or_slots") or []):
         slots.append(s)
 
-    # 2) ENV fan-in
+    # 2) OR_SLOTS JSON
+    or_slots_env = os.getenv("OR_SLOTS")
+    if or_slots_env:
+        try:
+            arr = json.loads(or_slots_env)
+            if isinstance(arr, list):
+                slots.extend(arr)
+        except Exception:
+            pass
+
+    # 3) ENV fan-in KEYS/MODEL
     env_keys = _split_multi(os.getenv("OPENROUTER_KEYS") or os.getenv("OPENROUTER_KEY"))
     env_models = _split_multi(os.getenv("OPENROUTER_MODEL"))
     env_base = _default_base()
@@ -115,7 +120,80 @@ def _build_slots_from_env_and_cfg() -> List[Tuple[str, str, str, float]]:
     return _dedup(slots)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Public API (sync) — з експоненціальним бекофом та зменшенням max_tokens
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _first_nonempty(*vals: Optional[str]) -> str:
+    for v in vals:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+def _extract_content(data: Any) -> str:
+    """
+    Універсальний екстрактор тексту з відповіді LLM/OpenRouter.
+    Підтримувані варіанти:
+      1) {"choices":[{"message":{"content":"..."}}, ...]}
+      2) {"choices":{"message":{"content":"..."}}}
+      3) {"message":{"content":"..."}}
+      4) {"content":"..."}
+      5) просто рядок
+    Якщо нічого не знайшли — повертає "".
+    """
+    try:
+        if isinstance(data, str):
+            # це може бути готовий текст або JSON-рядок
+            try:
+                parsed = json.loads(data)
+                data = parsed
+            except Exception:
+                return data.strip()
+
+        if not isinstance(data, dict):
+            return ""
+
+        # 1) choices як масив
+        ch = data.get("choices")
+        if isinstance(ch, list) and ch:
+            first = ch[0] or {}
+            msg = first.get("message", first)
+            if isinstance(msg, dict):
+                txt = _first_nonempty(msg.get("content"))
+                if txt:
+                    return txt
+            if isinstance(first, dict):
+                txt = _first_nonempty(first.get("text"))
+                if txt:
+                    return txt
+            if isinstance(first, str):
+                return first.strip()
+
+        # 2) choices як dict
+        if isinstance(ch, dict):
+            msg = ch.get("message", ch)
+            if isinstance(msg, dict):
+                txt = _first_nonempty(msg.get("content"))
+                if txt:
+                    return txt
+
+        # 3) message на верхньому рівні
+        msg = data.get("message")
+        if isinstance(msg, dict):
+            txt = _first_nonempty(msg.get("content"))
+            if txt:
+                return txt
+
+        # 4) content на верхньому рівні
+        txt = _first_nonempty(data.get("content"))
+        if txt:
+            return txt
+
+        return ""
+    except Exception:
+        return ""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public API (sync)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def chat_completion(
@@ -131,12 +209,11 @@ def chat_completion(
 ) -> str:
     """
     Синхронний клієнт OpenRouter з:
-      • round‑robin ротацією ключів/моделей;
+      • ротацією ключів/моделей (explicit → trial_slots → CFG/ENV);
       • ретраями на 402/429/5xx/timeout;
       • експоненціальним бекофом (0.5s → ×2 → ≤ 8s);
-      • адаптивним зниженням max_tokens на 402 (підказка «fewer max_tokens» або з словами 'max_tokens').
-
-    Повертає текст відповіді (message.content або text). Якщо формат інший — вертає JSON.
+      • адаптивним зниженням max_tokens на 402.
+    Повертає чистий текст відповіді (str). Якщо всі спроби вичерпані — RuntimeError.
     """
     base_default = _default_base()
     endpoint = (endpoint or base_default).rstrip("/")
@@ -151,12 +228,12 @@ def chat_completion(
     # Кандидати слотів
     candidates: List[Tuple[str, str, str, float]] = []
 
-    # (1) explicit
+    # (1) явний ключ/модель
     if api_key:
         candidates.append((
             api_key,
             (model or _default_model()),
-            endpoint,                 # поважаємо явний endpoint
+            endpoint,
             timeout_global
         ))
 
@@ -175,7 +252,7 @@ def chat_completion(
     if not slots:
         raise RuntimeError("OpenRouter: no API keys configured (slots empty)")
 
-    # Заголовки (ASCII)
+    # Заголовки
     base_headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -192,7 +269,7 @@ def chat_completion(
         "max_tokens": dynamic_max,
     }
 
-    # Randomized round‑robin старт
+    # Randomized round-robin старт
     start_idx = random.randrange(len(slots)) if len(slots) > 1 else 0
     order = list(itertools.islice(itertools.cycle(range(len(slots))), start_idx, start_idx + len(slots)))
 
@@ -202,7 +279,7 @@ def chat_completion(
 
     last_err: Optional[str] = None
 
-    # Два проходи: на 1-му — як є; на 2-му — якщо був 402 з натяком → ріжемо max_tokens на 40%
+    # Два проходи: 1-й як є; 2-й — після потенційного урізання max_tokens на 402
     for pass_no in (1, 2):
         for idx in order:
             key, mdl, base, tout = slots[idx]
@@ -215,63 +292,63 @@ def chat_completion(
 
             url = (base or endpoint).rstrip("/") + "/chat/completions"
 
-            # експоненційний бекоф локально для цього слоту
             delay = backoff0
 
-            # Спробуємо до N=3 разів на кожному слоту перед переходом до наступного
+            # до 3 спроб на слот
             for attempt in range(1, 4):
                 try:
                     with httpx.Client(timeout=float(tout or timeout_global)) as cli:
                         r = cli.post(url, headers=headers, content=json.dumps(payload))
 
-                    # Обробка помилок
+                    # Статус-коди спершу
                     if r.status_code in (402, 429):
                         txt = (r.text or "")[:500]
                         last_err = f"{r.status_code} {txt}"
 
-                        # 402 → можливо мало балансу або ліміт токенів; якщо є натяк — зменшимо max_tokens
+                        # 402 → часто «fewer max_tokens»/«max_tokens»; спробуємо урізати на 40% і перейти далі
                         if r.status_code == 402 and ("fewer max_tokens" in txt.lower() or "max_tokens" in txt.lower()):
-                            # на наступному проході — зменшуємо
                             if pass_no == 1:
                                 dynamic_max = max(128, int(dynamic_max * 0.6))
-                            # невелика затримка й виходимо на наступний слот (не крутимо той самий)
                             time.sleep(min(delay, backoff_cap))
-                            break
+                            break  # наступний слот (у цьому проході)
 
-                        # 429 → ліміт запитів — почекаємо і повторимо ще раз на цьому ж слоті (до 3 спроб)
+                        # 429 → ліміт запитів; ретраїмо цей самий слот
                         if r.status_code == 429:
                             time.sleep(min(delay, backoff_cap))
                             delay = min(backoff_cap, delay * 2)
                             continue
 
-                        # інші 402 → просто переходимо на наступний слот
+                        # інші 402 → на наступний слот
                         time.sleep(min(delay, backoff_cap))
                         break
 
                     if 500 <= r.status_code < 600:
-                        # тимчасова проблема сервера — ретраїмо на цьому ж слоті з бекофом
+                        # тимчасова помилка сервера → ретраї на цьому ж слоті
                         last_err = f"{r.status_code} {r.text[:200]}"
                         time.sleep(min(delay, backoff_cap))
                         delay = min(backoff_cap, delay * 2)
                         continue
 
-                    # інші 4xx — не ретраїмо, переходимо до наступного слоту
-                    r.raise_for_status()
+                    # інші 4xx → не ретраїмо, йдемо на інший слот
+                    if 400 <= r.status_code < 500:
+                        last_err = f"{r.status_code} {r.text[:200]}"
+                        break
 
+                    # 2xx → парсимо
                     data = r.json()
 
-                    # Витягуємо текст відповіді
-                    text: Optional[str] = None
-                    choices = data.get("choices") or []
-                    if choices:
-                        ch = choices[0]
-                        msg = ch.get("message")
-                        if isinstance(msg, dict) and msg.get("content"):
-                            text = msg["content"]
-                        if text is None and isinstance(ch, dict) and "text" in ch:
-                            text = ch["text"]
-                    if text is None:
-                        text = json.dumps(data, ensure_ascii=False)
+                    # Надійно витягнути текст
+                    text = _extract_content(data)
+                    if not text:
+                        # спробуємо показати повідомлення про помилку з JSON
+                        err = (data.get("error") or {}).get("message") or data.get("detail") or ""
+                        if err:
+                            last_err = err
+                            break
+                        last_err = "empty-content"
+                        time.sleep(min(delay, backoff_cap))
+                        delay = min(backoff_cap, delay * 2)
+                        continue
 
                     return text
 
@@ -282,7 +359,7 @@ def chat_completion(
                     continue
                 except Exception as e:
                     last_err = str(e)
-                    # для непередбачених — одразу на наступний слот
+                    # несподіване — одразу до наступного слоту
                     break
 
     raise RuntimeError(f"OpenRouter request failed with all keys. Last error: {last_err}")

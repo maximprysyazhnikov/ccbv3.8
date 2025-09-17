@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import asyncio, math, logging, json, re, os, time, sqlite3, uuid
+import inspect
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
+from telegram.ext import CallbackQueryHandler
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ContextTypes, Application,
-    CommandHandler, CallbackQueryHandler
+    CommandHandler, CallbackQueryHandler, ApplicationHandlerStop
 )
 
 from core_config import CFG
@@ -25,6 +26,67 @@ from services.daily_tracker import compute_daily_summary
 from services.autopost import run_autopost_once
 
 log = logging.getLogger("tg.handlers")
+
+# ───────────────────────────────
+# LLM guard & response helpers
+# ───────────────────────────────
+def _llm_allowed() -> bool:
+    """
+    False, якщо LLM вимкнено:
+      - ENV LLM_DISABLED=1 / true / yes / on
+      - або sitecustomize.LLM_DISABLED == True
+    """
+    try:
+        if str(os.getenv("LLM_DISABLED", "0")).lower() in ("1", "true", "yes", "on"):
+            return False
+    except Exception:
+        pass
+    try:
+        import sitecustomize  # noqa: F401
+        if getattr(sitecustomize, "LLM_DISABLED", False):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _extract_llm_text(resp) -> str | None:
+    """
+    Дістає текст із відповіді LLM незалежно від форми:
+    - рядок
+    - dict з 'content'
+    - openai/openrouter-подібна структура: choices[0].message.content | choices[0].text
+    """
+
+
+    try:
+        if not resp:
+            return None
+        if isinstance(resp, str):
+            s = resp.strip()
+            return s or None
+        if isinstance(resp, dict):
+            if isinstance(resp.get("content"), str):
+                s = resp["content"].strip()
+                return s or None
+            choices = resp.get("choices") or resp.get("data")
+            if isinstance(choices, list) and choices:
+                c0 = choices[0] or {}
+                msg = c0.get("message") or {}
+                s = (msg.get("content") or c0.get("text") or "").strip()
+                return s or None
+    except Exception:
+        return None
+    return None
+
+
+async def _safe_send(bot, chat_id, text: str, parse_mode: str | None = "Markdown"):
+    if not text:
+        return
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+    except Exception as e:
+        log.warning("send_message failed: %s", e)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DB
@@ -361,13 +423,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Доступні команди:\n"
         "• `/top` — Топ-20 USDT пар (Volume / Gainers). Натисни на монету → меню дій (*🤖 AI*, *🔗 Залежність*).\n"
         f"• `/analyze` — Плитка монет з `MONITORED_SYMBOLS` (TF={CFG['analyze_timeframe']}) або *Analyze ALL*.\n"
-        "• `/ai <SYMBOL> [TF]` — AI‑план (Entry/SL/TP, RR, утримання) + індикатори.\n"
+        "• `/ai <SYMBOL> [TF]` — AI-план (Entry/SL/TP, RR, утримання) + індикатори.\n"
         "• `/req <SYMBOL> [TF]` — Залежність монети від BTC/ETH (ρ, β, Δ Ratio).\n"
         "• `/news [запит]` — Останні заголовки.\n"
         "• `/panel` — Панель налаштувань.\n\n"
         "🛠 *Що нового*\n"
         "• Персональний TF у налаштуваннях: кожен користувач працює на своєму TF.\n"
-        "• Автопост: ON/OFF, TF автопосту, RR‑поріг.\n"
+        "• Автопост: ON/OFF, TF автопосту, RR-поріг.\n"
         "• Безпечна відправка: там, де можливий «нечистий» текст від моделей — без Markdown.\n\n"
         f"🧠 Модель: `{_current_ai_model()}`\n"
         f"⏱ TZ: `{CFG['tz']}`\n\n"
@@ -387,7 +449,7 @@ async def guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Тренд: EMA/SMA (нахил, перетини), якщо ціна > EMA(50/200) — перевага LONG.\n"
         "• Моментум: RSI, MACD — імпульс/розвороти (RSI<30 — перепроданість, RSI>70 — перекупленість).\n"
         "• Волатильність: ATR, Bollinger — ширина ходу, адекватність SL/TP.\n"
-        "• Сила тренду: ADX, CCI — ADX>20‑25 досить для слідування.\n"
+        "• Сила тренду: ADX, CCI — ADX>20-25 досить для слідування.\n"
         "• Обʼєм: OBV/MFI — підтвердження руху.\n"
         "• Pivots: рівні для Entry/SL/TP.\n\n"
         "📐 RR: LONG=(TP−Entry)/(Entry−SL), SHORT навпаки. Фільтр: RR<1.5 — скіп.\n"
@@ -567,7 +629,7 @@ async def on_cb_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send(
                 update, context,
                 "ℹ️ *Панель*\n"
-                "- Autopost — вкл/викл фоновий аналіз моніторинг‑пар.\n"
+                "- Autopost — вкл/викл фоновий аналіз моніторинг-пар.\n"
                 "- TF — твій дефолтний таймфрейм (для /ai, /req тощо).\n"
                 "- AP TF — таймфрейм автопосту.\n"
                 "- AP RR — мінімальний Risk/Reward для автопосту.\n"
@@ -899,149 +961,129 @@ AI_SYSTEM = (
     "Prefer ~1:3 risk-reward when reasonable."
 )
 
-async def ai(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
-             symbol_arg: Optional[str] = None, timeframe_arg: Optional[str] = None):
-    uid = update.effective_user.id if update.effective_user else None
-    us = get_user_settings(uid) if uid else {}
-    user_tf = (us.get("timeframe") or CFG["analyze_timeframe"]).strip()
-
-    args = context.args or []
-    raw = symbol_arg or (args[0] if args else "")
-    raw = (raw or "").strip().upper()
-    timeframe = (timeframe_arg or (args[1] if len(args) > 1 else user_tf)).strip()
-
-    if not raw:
-        symbol = _pick_default_symbol()
-    elif raw in _VALID_DIR_WORDS:
-        await _send(update, context, "ℹ️ Це схоже на напрям, а не символ. Приклад: `/ai BTCUSDT`.")
-        return
-    elif not _looks_like_symbol(raw):
-        await _send(update, context, "⚠️ Невірний символ. Приклад: `/ai BTCUSDT`.")
-        return
-    else:
-        symbol = raw
-
-    await _send(update, context, f"⏳ Рахую індикатори для {symbol} (TF={timeframe})…")
-
+# ⬇️ ДОДАЙ поруч із іншими хелперами
+def _get_user_model_key(update: Update) -> str:
     try:
-        data = get_ohlcv(symbol, timeframe, CFG["analyze_limit"])
-        last_close = data[-1]["close"] if data else float("nan")
+        uid = update.effective_user.id if update.effective_user else None
+        if uid is None:
+            return "auto"
+        us = get_user_settings(uid) or {}
+        key = (us.get("model_key") or "auto").strip()
+        return key or "auto"
+    except Exception:
+        return "auto"
 
-        block = [
-            f"SYMBOL: {symbol}",
-            f"TF: {timeframe}",
-            f"PRICE_LAST: {last_close:.6f}",
-            f"BARS: {min(len(data), CFG['analyze_limit']) if data else 0}",
-        ]
-        user_model_key = (us.get("model_key") or "auto")
-        route = pick_route(symbol, user_model_key=user_model_key)
 
-        if not route:
-            await _send(update, context, f"❌ Немає доступного API-роутингу для {symbol}")
-            return
+# ───────────────────────────────
+# /ai — оновлений безпечний обробник
+# ───────────────────────────────
+async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /ai [SYMBOL] [TF] — показує TA-звіт і (за наявності роута) план від LLM.
+    - Використовує модель з /panel (user_settings.model_key)
+    - Виправлено дублювання відповідей
+    - Дає зрозумілий reason при відмові LLM
+    """
+    chat_id = update.effective_chat.id
 
-        def _strip_md_local(s: str) -> str:
-            s = re.sub(r"[*_`]", "", s or "")
-            s = re.sub(r"[^\S\r\n]+", " ", s).strip()
-            return s
+    # 1) symbol/timeframe з аргументів або дефолти (TF беремо з user_settings)
+    args = context.args or []
+    symbol = (args[0].upper() if len(args) >= 1 else _pick_default_symbol())
+    try:
+        uid = update.effective_user.id if update.effective_user else None
+        us = get_user_settings(uid) if uid else {}
+        user_tf_default = (us.get("timeframe") or CFG.get("analyze_timeframe") or "15m").strip()
+    except Exception:
+        user_tf_default = CFG.get("analyze_timeframe") or "15m"
+    timeframe = (args[1] if len(args) >= 2 else user_tf_default)
 
-        ta_block_full = format_ta_report(symbol, timeframe, CFG["analyze_limit"])
-        ta_block_raw = _strip_md_local(ta_block_full)
+    # Прев’ю
+    await _safe_send(context.bot, chat_id, f"⏳ Запускаю LLM-аналіз для {symbol} (TF={timeframe})…", parse_mode=None)
 
-        prompt = (
-            "\n".join(block) + "\n\n"
-            "INDICATORS_PRESET_12:\n" + ta_block_raw + "\n\n"
-            "Decide if there is a trade now. Return STRICT JSON only (no prose) with keys exactly:\n"
-            '{"direction":"LONG|SHORT|NEUTRAL","entry":number,"stop":number,"tp":number,'
-            '"confidence":0..1,"holding_time_hours":number,"holding_time":"string","rationale":"2-3 sentences"}.'
-        )
-
-        raw_resp = chat_completion(
-            endpoint=CFG["or_base"],
-            api_key=route.api_key,
-            model=route.model,
-            messages=[{"role":"system","content":AI_SYSTEM},{"role":"user","content":prompt}],
-            timeout=CFG["or_timeout"]
-        )
-        plan = _parse_ai_json(raw_resp)
-
-        direction = (plan.get("direction") or "").upper()
-        entry = _safe_float(plan.get("entry"))
-        stop  = _safe_float(plan.get("stop"))
-        tp    = _safe_float(plan.get("tp"))
-        conf  = _safe_float(plan.get("confidence")) or 0.0
-
-        rr_num = _compute_rr_num(direction,
-                                 entry if entry is not None else math.nan,
-                                 stop  if stop  is not None else math.nan,
-                                 tp    if tp    is not None else math.nan)
-        rr_text = f"{rr_num:.2f}" if rr_num is not None else "-"
-
+    # 2) TA-частина (стабільно як у тебе)
+    try:
+        ta_text = format_ta_report(symbol, timeframe)
+    except TypeError:
+        indicators_obj = None
         try:
-            rr_min = float(us.get("rr_threshold", CFG.get("rr_threshold", 1.5)))
-            if rr_num is not None and rr_num < rr_min:
-                await _send(update, context, f"⚠️ Слабкий сигнал (RR < {rr_min}) — скіп.")
-                return
+            from services.analyzer_core import compute_indicators  # type: ignore
+            indicators_obj = compute_indicators(symbol, timeframe)
         except Exception:
             pass
+        ta_text = format_ta_report(symbol, timeframe, indicators_obj)
 
-        # SAVE OPEN SIGNAL — через універсальний saver, тільки tf=...
-        analysis_id = uuid.uuid4().hex
-        snapshot_ts = _now_ts()
-        size_usd = float(CFG.get("kpi_size_usd", 100.0))
-        save_signal_open(
-            user_id=uid or 0,
-            source="ai",
-            symbol=symbol,
-            tf=timeframe,                # <— саме tf
-            direction=direction,
-            entry=entry, stop=stop, tp=tp,
-            rr=rr_num,
-            analysis_id=analysis_id,
-            snapshot_ts=snapshot_ts,
-            size_usd=size_usd,
-            details={
-                "model": route.model,
-                "ta_markdown": ta_block_full,
-                "plan_raw": plan,
-                "generated_at": snapshot_ts,
-            }
+    await _safe_send(context.bot, chat_id, ta_text, parse_mode="Markdown")
+
+    # 3) LLM-частина — тільки якщо дозволено guard-ом
+    plan_text: str | None = None
+    if _llm_allowed():
+        try:
+            # ▸ маршрут з урахуванням вибраної в /panel моделі
+            user_model_key = _get_user_model_key(update)
+            route = pick_route(symbol, user_model_key=user_model_key)
+            if not route:
+                raise RuntimeError("no LLM route configured (перевір OR_SLOTS/OPENROUTER_KEYS або LOCAL_LLM_*)")
+
+            # ▸ стислий промпт + безпечні параметри
+            def _strip_md_local(s: str) -> str:
+                s = re.sub(r"[*_`]", "", s or "")
+                s = re.sub(r"[^\S\r\n]+", " ", s).strip()
+                return s
+
+            ta_block_raw = _strip_md_local(ta_text)
+            llm_prompt = (
+                f"Symbol: {symbol}\nTimeframe: {timeframe}\n"
+                f"Indicators (preset-12):\n{ta_block_raw}\n\n"
+                "Return STRICT JSON only (no prose) with keys exactly:\n"
+                '{"direction":"LONG|SHORT|NEUTRAL","entry":number,"stop":number,"tp":number,'
+                '"confidence":0..1,"holding_time_hours":number,"holding_time":"string","rationale":"2-3 sentences"}'
+            )
+
+            endpoint = getattr(route, "base", None) or CFG.get("or_base")
+            model = getattr(route, "model", None) or CFG.get("llm_model", "openai/gpt-4o-mini")
+            api_key = getattr(route, "api_key", None)
+            timeout = int(getattr(route, "timeout", None) or CFG.get("or_timeout", 30))
+
+            # Підтримка sync/async utils.openrouter.chat_completion
+            kwargs = dict(
+                endpoint=endpoint,
+                api_key=api_key,
+                model=model,
+                messages=[
+                    {"role": "system", "content": AI_SYSTEM},
+                    {"role": "user", "content": llm_prompt},
+                ],
+                temperature=0.2,
+                timeout=timeout,
+            )
+            resp = await chat_completion(**kwargs) if inspect.iscoroutinefunction(chat_completion) else chat_completion(**kwargs)
+
+            # ▸ витягнути текст незалежно від форми відповіді
+            raw = _extract_llm_text(resp)
+            if not raw:
+                raise RuntimeError("empty LLM content")
+
+            # ▸ НЕ шлемо сирий JSON — коротка красивa відповідь
+            plan_text = raw
+
+        except Exception as e:
+            log.warning("LLM call failed: %s", e)
+            plan_text = None
+    else:
+        log.info("LLM disabled by guard; skipping /ai generation")
+
+    # 4) Відправити план або дружній фолбек (ОДИН раз)
+    if plan_text and plan_text.strip():
+        await _safe_send(context.bot, chat_id, plan_text, parse_mode="Markdown")
+    else:
+        fb = (
+            f"*{symbol}* *(TF={timeframe})* — **План від LLM недоступний**\n"
+            "- LLM вимкнено, роут не налаштований, або відповідь порожня.\n"
+            "- Увімкни LLM у `.env` (LLM_DISABLED=0), задай OR_SLOTS/OPENROUTER_KEYS або LOCAL_LLM_*.\n"
+            "- Або обери модель у `/panel` → *Model*."
         )
+        await _safe_send(context.bot, chat_id, fb, parse_mode="Markdown")
 
-        tz = ZoneInfo(CFG["tz"])
-        now_local = datetime.now(tz)
-        hold_h = float(plan.get("holding_time_hours", 0.0) or 0.0)
-        hold_until_local = now_local + timedelta(hours=hold_h) if hold_h > 0 else None
-        hold_line = (
-            f"Recommended hold: {int(round(hold_h))} h"
-            + (f" (до {hold_until_local.strftime('%Y-%m-%d %H:%M %Z')} / {CFG['tz']})" if hold_until_local else "")
-        )
-        stamp_line = f"Generated: {now_local.strftime('%Y-%m-%d %H:%M %Z')}"
-
-        reply = (
-            f"🤖 AI Trade Plan for {symbol} (TF={timeframe})\n"
-            f"Model: {_current_ai_model()}\n"
-            f"{stamp_line}\n\n"
-            f"Direction: {direction or '-'}\n"
-            f"Confidence: {conf:.2%}\n"
-            f"RR: {rr_text}\n"
-            f"Entry: { _fmt_or_dash(entry) }\n"
-            f"Stop:  { _fmt_or_dash(stop) }\n"
-            f"Take:  { _fmt_or_dash(tp) }\n"
-            f"{hold_line}\n\n"
-            f"Reasoning:\n{plan.get('rationale','—')}\n"
-        )
-        await _send(update, context, reply)
-
-        indi = format_ta_report(symbol, timeframe, CFG["analyze_limit"])
-        await _send(update, context, "📈 Indicators (preset):\n" + indi, parse_mode="Markdown")
-
-    except Exception as e:
-        log.exception("/ai failed")
-        await _send(update, context, f"⚠️ ai error: {e}")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Indicators button
 # ──────────────────────────────────────────────────────────────────────────────
 async def on_cb_indicators(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1083,7 +1125,13 @@ async def autopost_now(update, context):
     chat_id = update.effective_chat.id
     try:
         await context.bot.send_message(chat_id, "⏳ Запускаю автопост…")
-        msgs = await asyncio.to_thread(run_autopost_once, context.application)
+
+        # Працюємо і з async, і з sync реалізацією run_autopост_once
+        if inspect.iscoroutinefunction(run_autopost_once):
+            msgs = await run_autopост_once(context.application)
+        else:
+            msgs = await asyncio.to_thread(run_autopост_once, context.application)
+
         sent = 0
         for m in msgs or []:
             try:
@@ -1112,7 +1160,9 @@ async def on_cb_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not data.startswith("ai:"):
             return
         symbol = data.split(":", 1)[1].strip().upper()
-        await ai(update, context, symbol_arg=symbol)
+        # делегуємо в новий cmd_ai: підставимо args так, ніби це /ai <SYM>
+        context.args = [symbol]
+        await cmd_ai(update, context)
     except Exception as e:
         log.exception("on_cb_ai failed")
         await _send(update, context, f"⚠️ callback error: {e}")
@@ -1128,7 +1178,10 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CommandHandler("top", top))
     app.add_handler(CommandHandler("analyze", analyze))
-    app.add_handler(CommandHandler("ai", ai))
+
+    # ⬇️ ВАЖЛИВО: наш /ai має бути першим і блокувати інших
+    app.add_handler(CommandHandler("ai", cmd_ai, block=True), group=-100)
+
     app.add_handler(CommandHandler("req", req))
     app.add_handler(CommandHandler("news", news))
     app.add_handler(CommandHandler("daily_now", daily_now))

@@ -1,0 +1,94 @@
+*** a/telegram_bot/handlers.py
+--- b/telegram_bot/handlers.py
+@@
+-from utils.openrouter import chat_completion
++from utils.openrouter import chat_completion
++import os, inspect
+@@
+ log = logging.getLogger("tg.handlers")
+ 
++# ───────────────── LLM helpers ─────────────────
++def _llm_allowed() -> bool:
++    try:
++        if str(os.getenv("LLM_DISABLED", "0")).lower() in ("1","true","yes","on"):
++            return False
++    except Exception:
++        pass
++    try:
++        import sitecustomize  # noqa
++        if getattr(sitecustomize, "LLM_DISABLED", False):
++            return False
++    except Exception:
++        pass
++    return True
++
++def _extract_llm_text(resp) -> str | None:
++    try:
++        if not resp:
++            return None
++        if isinstance(resp, str):
++            s = resp.strip()
++            return s or None
++        if isinstance(resp, dict):
++            if isinstance(resp.get("content"), str):
++                s = resp["content"].strip()
++                return s or None
++            choices = resp.get("choices") or resp.get("data")
++            if isinstance(choices, list) and choices:
++                c0 = choices[0] or {}
++                msg = c0.get("message") or {}
++                s = (msg.get("content") or c0.get("text") or "").strip()
++                return s or None
++    except Exception:
++        return None
++    return None
++
+@@
+-async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+-    # ... твоя поточна логіка ...
+-    # тут відправлявся попередній хедер з дефісами і/або сирий JSON
++async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
++    chat_id = update.effective_chat.id
++    symbol = "BTCUSDT" if not context.args else context.args[0].upper()  # або твоя логіка символу
++    timeframe = "15m"  # або з аргументів/налаштувань
++
++    # 1) Прев’ю
++    try:
++        await context.bot.send_message(chat_id=chat_id, text=f"⏳ Запускаю LLM-аналіз для {symbol} (TF={timeframe})…")
++    except Exception:
++        pass
++
++    # 2) TA-звіт: лиши як було, важливо — ВІДПРАВИТИ його незалежно від LLM
++    ta_text = format_ta_report(symbol, timeframe, indicators_obj)
++    await context.bot.send_message(chat_id=chat_id, text=ta_text, parse_mode="Markdown")
++
++    # 3) LLM-план: жодного сирого JSON, показуємо тільки, якщо є зміст
++    plan_text: str | None = None
++    if _llm_allowed():
++        try:
++            req = {
++                "model": CFG.get("llm_model", "openai/gpt-4o-mini"),
++                "messages": [
++                    {"role": "system", "content": "You are a disciplined crypto scalping assistant. Keep it concise."},
++                    {"role": "user", "content": llm_prompt},  # твій уже сформований промпт
++                ],
++                "temperature": 0.2,
++            }
++            resp = await chat_completion(req) if inspect.iscoroutinefunction(chat_completion) else chat_completion(req)
++            plan_text = _extract_llm_text(resp)
++        except Exception as e:
++            log.warning("LLM call failed: %s", e)
++            plan_text = None
++    else:
++        log.info("LLM disabled; skipping /ai LLM part")
++
++    if plan_text and plan_text.strip():
++        await context.bot.send_message(chat_id=chat_id, text=plan_text, parse_mode="Markdown")
++    else:
++        # дружній фолбек замість «Entry: - …» і JSON
++        fb = (
++            f"*{symbol}* *(TF={timeframe})* — **План від LLM недоступний**\n"
++            "- LLM вимкнено або відповідь порожня.\n"
++            "- Користуйся TA-блоком вище або увімкни LLM."
++        )
++        await context.bot.send_message(chat_id=chat_id, text=fb, parse_mode="Markdown")

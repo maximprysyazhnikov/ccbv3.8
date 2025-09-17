@@ -1,17 +1,19 @@
 # telegram_bot/handlers_addons.py
 from __future__ import annotations
-from telegram import Update
-from telegram.ext import ContextTypes, Application, CommandHandler
-from services.daily_tracker import daily_now
-from services.winrate_tracker import winrate_now
+from telegram.ext import Application, CallbackQueryHandler
+from telegram_bot import panel_neutral  # /neutral, /kpi і їх callback-и
+from services.daily_tracker import compute_daily_summary
 
-async def cmd_daily_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await daily_now(context.bot, update.effective_chat.id)
-
-async def cmd_winrate_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    days = int(context.args[0]) if context.args else 7
-    await winrate_now(context.bot, update.effective_chat.id, days)
+async def cmd_daily_now(update, context):
+    try:
+        text = compute_daily_summary()  # без аргументів!
+        await update.effective_chat.send_message(text)
+    except Exception as e:
+        await update.effective_chat.send_message(f"⚠️ daily_now error: {e}")
 
 def register_extra(app: Application):
-    app.add_handler(CommandHandler("daily_now", cmd_daily_now))
-    app.add_handler(CommandHandler("winrate_now", cmd_winrate_now))
+    # Кнопки з /panel → ті самі екрани, що й /neutral та /kpi
+    app.add_handler(CallbackQueryHandler(panel_neutral.cmd_neutral, pattern=r"^panel:neutral$"))
+    app.add_handler(CallbackQueryHandler(panel_neutral.cmd_kpi,     pattern=r"^panel:kpi$"))
+    # Кнопки вибору режиму на екрані Neutral (CLOSE/TRAIL/IGNORE)
+    app.add_handler(CallbackQueryHandler(panel_neutral.cb_neutral,  pattern=r"^neutral_mode:"))

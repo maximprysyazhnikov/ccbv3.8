@@ -1,94 +1,360 @@
-# utils/db_migrate.py
 from __future__ import annotations
-import os, sqlite3
+import logging
+import os
+import sqlite3
+from typing import Dict, Iterable, Tuple, Any
 
-DB_PATH = os.getenv("DB_PATH") or os.path.join("storage", "bot.db")
+from utils.db import get_conn
 
-DDL_USER_SETTINGS = """
-CREATE TABLE IF NOT EXISTS user_settings (
-  user_id       INTEGER PRIMARY KEY,
-  timeframe     TEXT    DEFAULT '15m',
-  autopost      INTEGER DEFAULT 0,
-  autopost_tf   TEXT    DEFAULT '15m',
-  autopost_rr   REAL    DEFAULT 1.5,
-  rr_threshold  REAL    DEFAULT 1.5,
-  model_key     TEXT    DEFAULT 'auto',
-  locale        TEXT    DEFAULT 'uk',
-  daily_tracker INTEGER DEFAULT 0,
-  winrate_tracker INTEGER DEFAULT 0
-);
-"""
+log = logging.getLogger("migrate")
 
-DDL_SIGNALS = """
-CREATE TABLE IF NOT EXISTS signals (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id    INTEGER NOT NULL,
-  symbol     TEXT    NOT NULL,
-  tf         TEXT    NOT NULL,
-  direction  TEXT    CHECK(direction IN ('LONG','SHORT')) NOT NULL,
-  entry      REAL    NOT NULL,
-  sl         REAL    NOT NULL,
-  tp         REAL    NOT NULL,
-  rr         REAL    NOT NULL,
-  ts_created INTEGER NOT NULL,
-  ts_closed  INTEGER,
-  status     TEXT    CHECK(status IN ('OPEN','WIN','LOSS','SKIP')) NOT NULL,
-  pnl_pct    REAL
-);
-"""
 
-DDL_AUTOPOST_LOG = """
-CREATE TABLE IF NOT EXISTS autopost_log (
-  id       INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id  INTEGER NOT NULL,
-  symbol   TEXT    NOT NULL,
-  tf       TEXT    NOT NULL,
-  rr       REAL    NOT NULL,
-  ts_sent  INTEGER NOT NULL
-);
-"""
+# ──────────────────────────────────────────────
+# helpers
+# ──────────────────────────────────────────────
+def _table_columns(conn: sqlite3.Connection, table: str) -> Dict[str, Tuple[str, int, Any]]:
+    """
+    Повертає {col_name: (col_type, notnull, dflt_value)}.
+    """
+    cols = {}
+    for cid, name, ctype, notnull, dflt_value, pk in conn.execute(f"PRAGMA table_info({table})"):
+        cols[name] = (ctype or "", int(notnull or 0), dflt_value)
+    return cols
 
-# idempotent ALTERs — безпечно запускати багато разів
-ALTERS_USER_SETTINGS = [
-    ("autopost_tf",   "TEXT",    "15m"),
-    ("autopost_rr",   "REAL",    "1.5"),
-    ("rr_threshold",  "REAL",    "1.5"),
-    ("model_key",     "TEXT",    "'auto'"),
-    ("locale",        "TEXT",    "'uk'"),
-    ("daily_tracker", "INTEGER", "0"),
-    ("winrate_tracker","INTEGER","0"),
-]
 
-INDEXES = [
-    ("CREATE INDEX IF NOT EXISTS idx_signals_user_open ON signals(user_id, status)",),
-    ("CREATE INDEX IF NOT EXISTS idx_aplog_dedup ON autopost_log(user_id, symbol, tf, ts_sent)",),
-]
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return bool(row)
 
-def column_exists(cur: sqlite3.Cursor, table: str, col: str) -> bool:
-    cur.execute(f"PRAGMA table_info({table})")
-    return any(row[1] == col for row in cur.fetchall())
 
-def migrate(db_path: str = DB_PATH) -> None:
+def _ensure_table(conn: sqlite3.Connection, table_sql: str) -> None:
+    conn.execute(table_sql)
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, col_name: str, decl: str) -> None:
+    """
+    Додає колонку, якщо її немає. decl — повний фрагмент оголошення типу (наприклад 'REAL', 'TEXT', 'INTEGER').
+    УВАГА: для SQLite ALTER TABLE ADD COLUMN не підтримує NOT NULL без дефолта – використовуємо м'які типи.
+    """
+    cols = _table_columns(conn, table)
+    if col_name not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {decl}")
+
+
+def _ensure_index(conn: sqlite3.Connection, name: str, sql: str) -> None:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+        (name,),
+    ).fetchone()
+    if not row:
+        conn.execute(sql)
+
+
+def _upsert_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    row = conn.execute("SELECT 1 FROM settings WHERE key=?", (key,)).fetchone()
+    if row:
+        return
+    conn.execute("INSERT INTO settings(key, value) VALUES(?, ?)", (key, value))
+
+
+# ──────────────────────────────────────────────
+# schema ensure (create-if-missing + add-missing-columns)
+# ──────────────────────────────────────────────
+def _ensure_signals(conn: sqlite3.Connection) -> None:
+    if not _has_table(conn, "signals"):
+        _ensure_table(conn, """
+        CREATE TABLE IF NOT EXISTS signals(
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id       INTEGER DEFAULT 0,
+            symbol        TEXT NOT NULL,
+            timeframe     TEXT NOT NULL,
+            direction     TEXT,
+            entry         REAL,
+            sl            REAL,
+            tp            REAL,
+            rr            REAL,
+            source        TEXT,
+            status        TEXT,
+            opened_at     TEXT,
+            closed_at     TEXT,
+            pnl_usd       REAL,
+            rr_real       REAL,
+            tf            TEXT,
+            analysis_id   TEXT,
+            snapshot_ts   INTEGER,
+            size_usd      REAL,
+            ts_created    INTEGER,
+            ts_closed     INTEGER,
+            pnl_pct       REAL,
+            details       TEXT,
+            reason_close  TEXT,
+            trend_ok      INTEGER,
+            atr_entry     REAL,
+            ema50         REAL,
+            ema200        REAL,
+            rr_target     REAL,
+            entry_sl_dist REAL,
+            trade_id      INTEGER,
+            decision      TEXT,
+            created_at    TEXT,
+            reject_reason TEXT
+        )""")
+
+    # доганяємо колонки (міграція 004 та інші)
+    desired: Dict[str, str] = {
+        "user_id": "INTEGER",
+        "symbol": "TEXT",
+        "timeframe": "TEXT",
+        "direction": "TEXT",
+        "entry": "REAL",
+        "sl": "REAL",
+        "tp": "REAL",
+        "rr": "REAL",
+        "source": "TEXT",
+        "status": "TEXT",
+        "opened_at": "TEXT",
+        "closed_at": "TEXT",
+        "pnl_usd": "REAL",
+        "rr_real": "REAL",
+        "tf": "TEXT",
+        "analysis_id": "TEXT",
+        "snapshot_ts": "INTEGER",
+        "size_usd": "REAL",
+        "ts_created": "INTEGER",
+        "ts_closed": "INTEGER",
+        "pnl_pct": "REAL",
+        "details": "TEXT",
+        "reason_close": "TEXT",
+        "trend_ok": "INTEGER",
+        "atr_entry": "REAL",
+        "ema50": "REAL",
+        "ema200": "REAL",
+        "rr_target": "REAL",
+        "entry_sl_dist": "REAL",
+        "trade_id": "INTEGER",
+        "decision": "TEXT",
+        "created_at": "TEXT",
+        "reject_reason": "TEXT",
+    }
+    for col, decl in desired.items():
+        _ensure_column(conn, "signals", col, decl)
+
+    # індекси
+    _ensure_index(conn, "ix_signals_closed_at",
+                  "CREATE INDEX IF NOT EXISTS ix_signals_closed_at ON signals(closed_at)")
+    _ensure_index(conn, "ix_signals_status",
+                  "CREATE INDEX IF NOT EXISTS ix_signals_status ON signals(status)")
+
+
+def _ensure_trades(conn: sqlite3.Connection) -> None:
+    if not _has_table(conn, "trades"):
+        _ensure_table(conn, """
+        CREATE TABLE IF NOT EXISTS trades(
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id       INTEGER,
+            symbol          TEXT NOT NULL,
+            timeframe       TEXT NOT NULL,
+            direction       TEXT,
+            entry           REAL,
+            sl              REAL,
+            tp              REAL,
+            opened_at       TEXT,
+            closed_at       TEXT,
+            close_reason    TEXT,
+            status          TEXT,
+            size_usd        REAL,
+            fees_bps        REAL,
+            rr_planned      REAL,
+            pnl             REAL,
+            rr              REAL,
+            close_price     REAL,
+            reason_close    TEXT,
+            trend_ok        INTEGER,
+            atr_entry       REAL,
+            ema50           REAL,
+            ema200          REAL,
+            rr_target       REAL,
+            entry_sl_dist   REAL,
+            partial_50_done INTEGER,
+            be_done         INTEGER,
+            avg_entry       REAL,
+            filled_buckets  INTEGER,
+            target_rrs_json TEXT,
+            pnl_usd         REAL,
+            rr_realized     REAL,
+            trail_mode      TEXT
+        )""")
+
+    desired: Dict[str, str] = {
+        "signal_id": "INTEGER",
+        "symbol": "TEXT",
+        "timeframe": "TEXT",
+        "direction": "TEXT",
+        "entry": "REAL",
+        "sl": "REAL",
+        "tp": "REAL",
+        "opened_at": "TEXT",
+        "closed_at": "TEXT",
+        "close_reason": "TEXT",
+        "status": "TEXT",
+        "size_usd": "REAL",
+        "fees_bps": "REAL",
+        "rr_planned": "REAL",
+        "pnl": "REAL",
+        "rr": "REAL",
+        "close_price": "REAL",
+        "reason_close": "TEXT",
+        "trend_ok": "INTEGER",
+        "atr_entry": "REAL",
+        "ema50": "REAL",
+        "ema200": "REAL",
+        "rr_target": "REAL",
+        "entry_sl_dist": "REAL",
+        "partial_50_done": "INTEGER",
+        "be_done": "INTEGER",
+        "avg_entry": "REAL",
+        "filled_buckets": "INTEGER",
+        "target_rrs_json": "TEXT",
+        "pnl_usd": "REAL",
+        "rr_realized": "REAL",
+        "trail_mode": "TEXT",
+    }
+    for col, decl in desired.items():
+        _ensure_column(conn, "trades", col, decl)
+
+
+def _ensure_user_settings(conn: sqlite3.Connection) -> None:
+    if not _has_table(conn, "user_settings"):
+        _ensure_table(conn, """
+        CREATE TABLE IF NOT EXISTS user_settings(
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id  INTEGER NOT NULL,
+            key      TEXT NOT NULL,
+            value    TEXT,
+            UNIQUE(user_id, key)
+        )""")
+
+
+def _ensure_settings(conn: sqlite3.Connection) -> None:
+    if not _has_table(conn, "settings"):
+        _ensure_table(conn, """
+        CREATE TABLE IF NOT EXISTS settings(
+            key    TEXT PRIMARY KEY,
+            value  TEXT
+        )""")
+
+    # дефолти (ключі з нашого чек-листа)
+    defaults = {
+        "tz_name": "Europe/Kyiv",
+        "kpi_days": "7",
+        "kpi_rr_bucket": "2",
+        "neutral_mode": "TRAIL",           # CLOSE | TRAIL | IGNORE
+        "min_entry_rr": "1.5",
+        "risk_per_trade": "0.0075",
+        "atr_sl_mult": "2.0",
+        "partial_tp_enabled": "true",
+        "partial_tp_pct": "0.5",
+        "move_be_at_rr": "1.0",
+        "indicator_gate_enabled": "false",
+        "indicator_min_pass": "8",
+        "atr_min": "0.004",
+        "rsi_long_min": "50",
+        "rsi_short_max": "50",
+        "adx_min": "18",
+        "bbw_min": "0.015",
+        "vol_rel_min": "1.2",
+        "vwap_dist_min": "0.0015",
+        "signal_sync_enabled": "false",
+        "rr_eps": "1e-6",
+        "dedup_window_sec": "90",
+        "autopost_user_id": "default",
+    }
+    for k, v in defaults.items():
+        _upsert_setting(conn, k, v)
+
+
+def _ensure_autopost_log(conn: sqlite3.Connection) -> None:
+    if not _has_table(conn, "autopost_log"):
+        _ensure_table(conn, """
+        CREATE TABLE IF NOT EXISTS autopost_log(
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id   INTEGER DEFAULT 0,
+            symbol    TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            rr        REAL,
+            ts_sent   INTEGER,
+            ts        INTEGER
+        )""")
+
+    desired: Dict[str, str] = {
+        "user_id": "INTEGER",
+        "symbol": "TEXT",
+        "timeframe": "TEXT",
+        "rr": "REAL",
+        "ts_sent": "INTEGER",
+        "ts": "INTEGER",
+    }
+    for col, decl in desired.items():
+        _ensure_column(conn, "autopost_log", col, decl)
+
+    _ensure_index(conn, "ix_autopost_user_sym_tf_ts",
+                  "CREATE INDEX IF NOT EXISTS ix_autopost_user_sym_tf_ts "
+                  "ON autopost_log(user_id, symbol, timeframe, ts)")
+
+
+# ──────────────────────────────────────────────
+# public entrypoints
+# ──────────────────────────────────────────────
+def migrate_if_needed() -> None:
+    """
+    Ідемпотентна міграція схеми. Безпечна до повторного запуску.
+    """
+    db_path = os.getenv("DB_PATH", "storage/bot.db")
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
-        c = conn.cursor()
 
-        # Базові таблиці
-        c.execute(DDL_USER_SETTINGS)
-        c.execute(DDL_SIGNALS)
-        c.execute(DDL_AUTOPOST_LOG)
+    with get_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=OFF;")   # схеми без FK
 
-        # Додати відсутні колонки user_settings
-        for col, typ, default in ALTERS_USER_SETTINGS:
-            if not column_exists(c, "user_settings", col):
-                c.execute(f"ALTER TABLE user_settings ADD COLUMN {col} {typ} DEFAULT {default}")
-
-        # Індекси
-        for (ddl,) in INDEXES:
-            c.execute(ddl)
+        _ensure_settings(conn)
+        _ensure_user_settings(conn)
+        _ensure_signals(conn)
+        _ensure_trades(conn)
+        _ensure_autopost_log(conn)
 
         conn.commit()
-    print(f"[migrate] OK → {db_path}")
 
-if __name__ == "__main__":
-    migrate()
+    log.info("[migrate] done -> %s", db_path)
+
+    # utils/db_migrate.py
+    def ensure_indexes_and_triggers(conn):
+        cur = conn.cursor()
+        cur.executescript("""
+        -- індекси для швидких KPI/репортів
+        CREATE INDEX IF NOT EXISTS ix_trades_closed_at  ON trades(closed_at);
+        CREATE INDEX IF NOT EXISTS ix_signals_closed_at ON signals(closed_at);
+
+        -- нормалізація статусу на рівні БД
+        CREATE TRIGGER IF NOT EXISTS trg_trades_status_closed_up
+        AFTER INSERT ON trades
+        WHEN LOWER(COALESCE(NEW.status,''))='closed'
+        BEGIN
+          UPDATE trades SET status='CLOSED' WHERE rowid=NEW.rowid;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_trades_status_closed_upd
+        AFTER UPDATE OF status ON trades
+        WHEN LOWER(COALESCE(NEW.status,''))='closed'
+        BEGIN
+          UPDATE trades SET status='CLOSED' WHERE rowid=NEW.rowid;
+        END;
+        """)
+        conn.commit()
+
+
+# зворотна сумісність на випадок, якщо десь звуть migrate()
+def migrate() -> None:
+    migrate_if_needed()
