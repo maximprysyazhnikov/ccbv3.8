@@ -13,7 +13,6 @@ def _mkparent(path: str) -> None:
     try:
         os.makedirs(parent, exist_ok=True)
     except Exception as e:
-        # Не фатально — спробуємо інші кандидати
         log.warning("[db] cannot create dir %s: %s", parent, e)
 
 def _candidates() -> list[str]:
@@ -21,11 +20,8 @@ def _candidates() -> list[str]:
     cands = []
     if env_path:
         cands.append(env_path)
-    # Найнадійніше місце на Railway — /data
-    cands.append("/data/bot.db")
-    # Локальний fallback (якщо немає volume або доступу)
-    cands.append(os.path.join(".", "data", "bot.db"))
-    # Унікалізуємо порядок
+    cands.append("/data/bot.db")                 # Railway volume
+    cands.append(os.path.join(".", "data", "bot.db"))  # local fallback
     uniq = []
     for p in cands:
         if p not in uniq:
@@ -36,7 +32,6 @@ def _try_connect(path: str) -> Optional[sqlite3.Connection]:
     try:
         _mkparent(path)
         con = sqlite3.connect(path, timeout=30, check_same_thread=False)
-        # Легка перевірка доступу/запису
         con.execute("PRAGMA journal_mode=WAL;")
         return con
     except Exception as e:

@@ -3,6 +3,17 @@ from __future__ import annotations
 from dotenv import load_dotenv
 load_dotenv()
 
+import os, logging, sys
+print("[diag] sys.path =", sys.path)
+print("[diag] CWD =", os.getcwd())
+print("[diag] ENV.DB_PATH =", os.environ.get("DB_PATH"))
+try:
+    os.makedirs("/data", exist_ok=True)
+    open("/data/_rw_test", "w").write("ok")
+    print("[diag] /data write OK")
+except Exception as e:
+    print("[diag] /data write FAIL:", e)
+
 import os, logging
 logging.getLogger("db").setLevel(logging.INFO)
 
