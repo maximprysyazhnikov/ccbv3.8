@@ -1,37 +1,20 @@
 # utils/user_settings.py
 from __future__ import annotations
-import os
 import sqlite3
 from typing import Any, Dict
+from utils.db import get_conn  # ← ЄДИНИЙ шлях до БД
 
-# Один шлях до БД для всього проєкту
-DB_PATH = (
-    os.getenv("DB_PATH")
-    or os.getenv("SQLITE_PATH")
-    or os.getenv("DATABASE_PATH")
-    or "storage/bot.db"
-)
-
-
-try:
-    from utils.db_migrate import migrate as _migrate_db
-    _migrate_db()  # гарантує наявність колонок/таблиць
-except Exception:
-    pass
-
-def _conn() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+# ──────────────────────────────────────────────
+# schema bootstrap (ідемпотентно)
+# ──────────────────────────────────────────────
 def _ensure_schema() -> None:
-    with _conn() as c:
+    with get_conn() as c:
         cur = c.cursor()
-        # Базова таблиця налаштувань
+        # Колонкова схема (один рядок на user_id)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS user_settings(
-          user_id        INTEGER PRIMARY KEY,
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id        INTEGER NOT NULL UNIQUE,
           timeframe      TEXT    DEFAULT '15m',
           autopost       INTEGER DEFAULT 0,
           autopost_tf    TEXT    DEFAULT '15m',
@@ -44,44 +27,66 @@ def _ensure_schema() -> None:
           winrate_tracker INTEGER DEFAULT 0
         )
         """)
-        # Ідемпотентно додаємо відсутні колонки (на випадок старої БД)
+        # Додаємо відсутні колонки (мʼяко)
         cur.execute("PRAGMA table_info(user_settings)")
         have = {r[1] for r in cur.fetchall()}
         add_cols = {
+            "timeframe":       "ALTER TABLE user_settings ADD COLUMN timeframe TEXT DEFAULT '15m'",
+            "autopost":        "ALTER TABLE user_settings ADD COLUMN autopost INTEGER DEFAULT 0",
+            "autopost_tf":     "ALTER TABLE user_settings ADD COLUMN autopost_tf TEXT DEFAULT '15m'",
+            "autopost_rr":     "ALTER TABLE user_settings ADD COLUMN autopost_rr REAL DEFAULT 1.5",
+            "rr_threshold":    "ALTER TABLE user_settings ADD COLUMN rr_threshold REAL DEFAULT 1.5",
+            "model_key":       "ALTER TABLE user_settings ADD COLUMN model_key TEXT DEFAULT 'auto'",
+            "locale":          "ALTER TABLE user_settings ADD COLUMN locale TEXT DEFAULT 'uk'",
             "daily_tracker":   "ALTER TABLE user_settings ADD COLUMN daily_tracker INTEGER DEFAULT 0",
             "daily_rr":        "ALTER TABLE user_settings ADD COLUMN daily_rr REAL DEFAULT 3.0",
             "winrate_tracker": "ALTER TABLE user_settings ADD COLUMN winrate_tracker INTEGER DEFAULT 0",
-            "rr_threshold":    "ALTER TABLE user_settings ADD COLUMN rr_threshold REAL DEFAULT 1.5",
         }
         for col, ddl in add_cols.items():
             if col not in have:
-                try: cur.execute(ddl)
-                except sqlite3.OperationalError: pass
+                try:
+                    cur.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
         c.commit()
 
 _ensure_schema()
 
+# ──────────────────────────────────────────────
+# helpers
+# ──────────────────────────────────────────────
 def ensure_user_row(user_id: int) -> None:
-    with _conn() as c:
-        c.execute("INSERT OR IGNORE INTO user_settings(user_id) VALUES(?)", (user_id,))
+    with get_conn() as c:
+        c.execute("""
+            INSERT INTO user_settings(user_id) VALUES (?)
+            ON CONFLICT(user_id) DO NOTHING
+        """, (user_id,))
         c.commit()
 
 def get_user_settings(user_id: int) -> Dict[str, Any]:
-    with _conn() as c:
-        cur = c.execute("SELECT * FROM user_settings WHERE user_id=?", (user_id,))
+    ensure_user_row(user_id)
+    with get_conn() as c:
+        cur = c.execute("""
+            SELECT user_id, timeframe, autopost, autopost_tf, autopost_rr,
+                   rr_threshold, model_key, locale, daily_tracker, daily_rr, winrate_tracker
+            FROM user_settings WHERE user_id=?
+        """, (user_id,))
         row = cur.fetchone()
-        return dict(row) if row else {}
+        if not row:
+            return {}
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
 
 def set_user_settings(user_id: int, **kwargs: Any) -> None:
     """
-    Гнучкий апдейт будь‑яких полів user_settings.
-    Приклад: set_user_settings(123, daily_tracker=1, daily_rr=2.5)
+    Гнучкий апдейт полів user_settings.
+    Приклад: set_user_settings(123, autopost_rr=2.0, autopost=1)
     """
     if not kwargs:
         return
     ensure_user_row(user_id)
     cols = [f"{k}=?" for k in kwargs.keys()]
     vals = list(kwargs.values()) + [user_id]
-    with _conn() as c:
+    with get_conn() as c:
         c.execute(f"UPDATE user_settings SET {', '.join(cols)} WHERE user_id=?", vals)
         c.commit()
