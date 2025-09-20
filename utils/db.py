@@ -1,14 +1,26 @@
+# utils/db.py
 from __future__ import annotations
-import os, sqlite3
-from contextlib import contextmanager
+import os
+import sqlite3
+import contextlib
 
-DB_PATH = os.getenv("DB_PATH", "storage/bot.db")
+def _resolve_db_path() -> str:
+    # 1) читаємо кожного разу з env, щоб не було проблем із порядком імпортів
+    p = os.environ.get("DB_PATH", "/data/bot.db")
+    # 2) якщо шлях відносний — створимо базову теку
+    base = os.path.dirname(p) or "."
+    os.makedirs(base, exist_ok=True)  # не впаде, якщо /data вже примонтовано
+    return p
 
-@contextmanager
+@contextlib.contextmanager
 def get_conn():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    db_path = _resolve_db_path()
+    # timeout/PRAGMAs підлаштовуй під себе
+    con = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     try:
         yield con
     finally:
-        con.close()
+        try:
+            con.close()
+        except Exception:
+            pass

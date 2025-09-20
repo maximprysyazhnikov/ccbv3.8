@@ -358,24 +358,24 @@ def migrate_if_needed() -> None:
     """
     Ідемпотентна міграція схеми. Безпечна до повторного запуску.
     """
-    db_path = os.getenv("DB_PATH", "storage/bot.db")
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    from utils.db import get_conn  # важливо: тягнемо після завантаження env
 
     with get_conn() as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=OFF;")   # схеми без FK
+        conn.execute("PRAGMA foreign_keys=OFF;")
 
         _ensure_settings(conn)
-        _ensure_user_settings(conn)   # важливо перед панелями
+        _ensure_user_settings(conn)
         _ensure_signals(conn)
         _ensure_trades(conn)
         _ensure_autopost_log(conn)
         _ensure_indexes_and_triggers(conn)
 
+        # покажемо ФАКТИЧНИЙ файл БД (дуже корисно в логах Railway)
+        db_file = conn.execute("PRAGMA database_list").fetchone()[2]
         conn.commit()
 
-    log.info("[migrate] done -> %s", db_path)
-
+    log.info("[migrate] done -> %s", db_file)
 
 # зворотна сумісність на випадок, якщо десь звуть migrate()
 def migrate() -> None:
