@@ -101,9 +101,10 @@ _ensure_schema()
 def ensure_user_row(user_id: int) -> None:
     """Гарантує якірний рядок для user_id (щоб UPDATE завжди мав що оновлювати)."""
     with get_conn() as c:
-        # INSERT OR IGNORE працює як з унікальним індексом, так і без нього (на випадок дуже старої БД)
+        # Безпечніше за ON CONFLICT(...): не вимагає наявності UNIQUE/PK просто зараз
         c.execute("INSERT OR IGNORE INTO user_settings(user_id) VALUES (?)", (user_id,))
         c.commit()
+
 
 def get_user_settings(user_id: int) -> Dict[str, Any]:
     ensure_user_row(user_id)
