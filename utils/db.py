@@ -1,26 +1,24 @@
-# utils/db.py
 from __future__ import annotations
 import os
 import sqlite3
-import contextlib
+from contextlib import contextmanager
 
-def _resolve_db_path() -> str:
-    # 1) читаємо кожного разу з env, щоб не було проблем із порядком імпортів
-    p = os.environ.get("DB_PATH", "/data/bot.db")
-    # 2) якщо шлях відносний — створимо базову теку
-    base = os.path.dirname(p) or "."
-    os.makedirs(base, exist_ok=True)  # не впаде, якщо /data вже примонтовано
-    return p
+# Визначаємо шлях до БД
+DB_PATH = os.getenv("DB_PATH")
+if not DB_PATH:
+    # Railway монтує volume у /data
+    DB_PATH = "/data/bot.db"
 
-@contextlib.contextmanager
-def get_conn():
-    db_path = _resolve_db_path()
-    # timeout/PRAGMAs підлаштовуй під себе
-    con = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+
+@contextmanager
+def get_conn() -> sqlite3.Connection:
+    """
+    Повертає SQLite-зʼєднання з БД у /data/bot.db (Railway).
+    Автоматично створює директорію, якщо її немає.
+    """
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
     try:
         yield con
     finally:
-        try:
-            con.close()
-        except Exception:
-            pass
+        con.close()
