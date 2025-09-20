@@ -23,7 +23,7 @@ def _candidates() -> list[str]:
         cands.append(env_path)
     # Найнадійніше місце на Railway — /data
     cands.append("/data/bot.db")
-    # Локальний fallback (якщо немає volume)
+    # Локальний fallback (якщо немає volume або доступу)
     cands.append(os.path.join(".", "data", "bot.db"))
     # Унікалізуємо порядок
     uniq = []
@@ -35,9 +35,8 @@ def _candidates() -> list[str]:
 def _try_connect(path: str) -> Optional[sqlite3.Connection]:
     try:
         _mkparent(path)
-        # Якщо директорія існує, але недоступна на запис — SQLite впаде тут
         con = sqlite3.connect(path, timeout=30, check_same_thread=False)
-        # Легка перевірка доступу
+        # Легка перевірка доступу/запису
         con.execute("PRAGMA journal_mode=WAL;")
         return con
     except Exception as e:
@@ -46,7 +45,7 @@ def _try_connect(path: str) -> Optional[sqlite3.Connection]:
 
 @contextlib.contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
-    last_err: Optional[Exception] = None
+    tried = []
     for path in _candidates():
         con = _try_connect(path)
         if con is not None:
@@ -59,6 +58,7 @@ def get_conn() -> Iterator[sqlite3.Connection]:
                 except Exception:
                     pass
             return
-    # Якщо сюди дійшли — жоден кандидат не відкрився
-    raise sqlite3.OperationalError("unable to open database file (all candidates failed: "
-                                   + ", ".join(_candidates()) + ")")
+        tried.append(path)
+    raise sqlite3.OperationalError(
+        "unable to open database file (all candidates failed: " + ", ".join(tried) + ")"
+    )

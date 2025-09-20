@@ -3,6 +3,16 @@ from __future__ import annotations
 from dotenv import load_dotenv
 load_dotenv()
 
+import os, logging
+logging.getLogger("db").setLevel(logging.INFO)
+
+try:
+    os.makedirs("/data", exist_ok=True)
+    open("/data/_rw_test", "w").write("ok")
+    print("[fs] /data write OK")
+except Exception as e:
+    print("[fs] /data write FAIL:", e)
+
 import asyncio
 import logging
 import os
