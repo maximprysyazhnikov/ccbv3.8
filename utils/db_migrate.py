@@ -231,29 +231,127 @@ def _ensure_trades(conn: sqlite3.Connection) -> None:
 
 def _ensure_user_settings(conn: sqlite3.Connection) -> None:
     """
-    Історично `user_settings` була KV-таблицею (user_id, key, value).
-    Для сумісності з кодом, який читає колонками (autopost, autopost_rr, rr_threshold, neutral_mode),
-    додаємо ці колонки напряму до цієї ж таблиці. Це безпечно: KV-схема лишається працездатною.
+    Міграція user_settings зі старої KV-схеми (user_id,key,value, UNIQUE(user_id,key))
+    на колонкову схему з унікальним user_id.
+    Ідемпотентно: можна викликати багато разів.
     """
+    cur = conn.cursor()
+
+    # чи існує таблиця user_settings?
     if not _has_table(conn, "user_settings"):
-        _ensure_table(conn, """
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS user_settings(
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id  INTEGER NOT NULL,
-            key      TEXT NOT NULL,
-            value    TEXT,
-            UNIQUE(user_id, key)
-        )""")
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id         INTEGER NOT NULL UNIQUE,
+          timeframe       TEXT    DEFAULT '15m',
+          autopost        INTEGER DEFAULT 0,
+          autopost_tf     TEXT    DEFAULT '15m',
+          autopost_rr     REAL    DEFAULT 1.5,
+          rr_threshold    REAL    DEFAULT 1.5,
+          model_key       TEXT    DEFAULT 'auto',
+          locale          TEXT    DEFAULT 'uk',
+          daily_tracker   INTEGER DEFAULT 0,
+          daily_rr        REAL    DEFAULT 3.0,
+          winrate_tracker INTEGER DEFAULT 0
+        )
+        """)
+    else:
+        # таблиця є — зʼясуємо, це KV чи вже колонкова
+        cols = _table_columns(conn, "user_settings")
+        is_kv = ("key" in cols) and ("value" in cols)
+        has_unique_user = False
+        # перевіримо, чи є UNIQUE по user_id
+        idx_rows = cur.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type IN ('index','table') AND tbl_name='user_settings'"
+        ).fetchall()
+        for _, sql in (idx_rows or []):
+            if not sql:
+                continue
+            # топорно, але надійно — шукаємо UNIQUE(...user_id...)
+            s = sql.upper().replace("\n"," ")
+            if "UNIQUE" in s and "USER_ID" in s:
+                has_unique_user = True
+                break
 
-    # ── колонки, які очікують панелі/хендлери
-    _ensure_column(conn, "user_settings", "autopost",      "INTEGER DEFAULT 1")
-    _ensure_column(conn, "user_settings", "autopost_rr",   "REAL DEFAULT 1.5")
-    _ensure_column(conn, "user_settings", "rr_threshold",  "REAL DEFAULT 1.5")
-    _ensure_column(conn, "user_settings", "neutral_mode",  "TEXT DEFAULT 'TRAIL'")
+        if is_kv:
+            # ── МІГРАЦІЯ KV -> КОЛОНКИ ─────────────────────────────
+            cur.executescript("""
+            CREATE TABLE IF NOT EXISTS user_settings_new(
+              id              INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id         INTEGER NOT NULL UNIQUE,
+              timeframe       TEXT    DEFAULT '15m',
+              autopost        INTEGER DEFAULT 0,
+              autopost_tf     TEXT    DEFAULT '15m',
+              autopost_rr     REAL    DEFAULT 1.5,
+              rr_threshold    REAL    DEFAULT 1.5,
+              model_key       TEXT    DEFAULT 'auto',
+              locale          TEXT    DEFAULT 'uk',
+              daily_tracker   INTEGER DEFAULT 0,
+              daily_rr        REAL    DEFAULT 3.0,
+              winrate_tracker INTEGER DEFAULT 0
+            );
+            """)
+            # бекуємо значення з KV за ключами, що нам потрібні
+            # касти з запасом (INTEGER/REAL) і дефолти
+            cur.executescript("""
+            INSERT OR IGNORE INTO user_settings_new(user_id, autopost, autopost_rr, rr_threshold, model_key, locale)
+            SELECT
+            kv.user_id,
+            COALESCE(MAX(CASE WHEN kv.key='autopost'     THEN CAST(kv.value AS INTEGER) END), 0),
+            COALESCE(MAX(CASE WHEN kv.key='autopost_rr'  THEN CAST(kv.value AS REAL)    END), 1.5),
+            COALESCE(MAX(CASE WHEN kv.key='rr_threshold' THEN CAST(kv.value AS REAL)    END), 1.5),
+            COALESCE(MAX(CASE WHEN kv.key='model_key'    THEN kv.value END), 'auto'),
+            COALESCE(MAX(CASE WHEN kv.key='locale'       THEN kv.value END), 'uk')
+            FROM user_settings kv
+            GROUP BY kv.user_id;
 
-    # індекси для швидких вибірок по user_id
+            """)
+            # Переіменовуємо стару таблицю в user_settings_kv (на випадок звернень)
+            cur.executescript("""
+            ALTER TABLE user_settings RENAME TO user_settings_kv;
+            ALTER TABLE user_settings_new RENAME TO user_settings;
+            """)
+            conn.commit()
+        else:
+            # вже колонкова: переконаємось, що є UNIQUE(user_id) і потрібні колонки
+            if not has_unique_user:
+                # Якщо таблиця створена без UNIQUE(user_id), додамо обмеження через нову таблицю
+                cur.executescript("""
+                CREATE TABLE IF NOT EXISTS user_settings_tmp(
+                  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id         INTEGER NOT NULL UNIQUE,
+                  timeframe       TEXT    DEFAULT '15m',
+                  autopost        INTEGER DEFAULT 0,
+                  autopost_tf     TEXT    DEFAULT '15m',
+                  autopost_rr     REAL    DEFAULT 1.5,
+                  rr_threshold    REAL    DEFAULT 1.5,
+                  model_key       TEXT    DEFAULT 'auto',
+                  locale          TEXT    DEFAULT 'uk',
+                  daily_tracker   INTEGER DEFAULT 0,
+                  daily_rr        REAL    DEFAULT 3.0,
+                  winrate_tracker INTEGER DEFAULT 0
+                );
+                """)
+                # переносимо дані «як є» (по збігу назв колонок)
+                cur.executescript("""
+                INSERT OR IGNORE INTO user_settings_tmp(
+                  user_id, timeframe, autopost, autopost_tf, autopost_rr,
+                  rr_threshold, model_key, locale, daily_tracker, daily_rr, winrate_tracker
+                )
+                SELECT
+                  user_id, timeframe, autopost, autopost_tf, autopost_rr,
+                  rr_threshold, model_key, locale, daily_tracker, daily_rr, winrate_tracker
+                FROM user_settings;
+
+                DROP TABLE user_settings;
+                ALTER TABLE user_settings_tmp RENAME TO user_settings;
+                """)
+                conn.commit()
+
+    # на додачу — індекс по user_id (для швидкості вибірок/апдейтів)
     _ensure_index(conn, "ix_user_settings_user_id",
                   "CREATE INDEX IF NOT EXISTS ix_user_settings_user_id ON user_settings(user_id)")
+
 
 
 def _ensure_settings(conn: sqlite3.Connection) -> None:
@@ -295,8 +393,10 @@ def _ensure_settings(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_autopost_log(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    # якщо таблиці ще нема — створюємо одразу з UNIQUE
     if not _has_table(conn, "autopost_log"):
-        _ensure_table(conn, """
+        cur.executescript("""
         CREATE TABLE IF NOT EXISTS autopost_log(
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id   INTEGER DEFAULT 0,
@@ -304,23 +404,45 @@ def _ensure_autopost_log(conn: sqlite3.Connection) -> None:
             timeframe TEXT NOT NULL,
             rr        REAL,
             ts_sent   INTEGER,
-            ts        INTEGER
-        )""")
+            ts        INTEGER,
+            UNIQUE(user_id, symbol, timeframe, ts)
+        );
+        """)
+    else:
+        # перевіряємо чи є потрібний UNIQUE
+        rows = cur.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='autopost_log'"
+        ).fetchone()
+        has_unique = False
+        if rows and rows[0]:
+            s = rows[0].upper().replace("\n"," ")
+            has_unique = "UNIQUE" in s and "USER_ID" in s and "SYMBOL" in s and "TIMEFRAME" in s and "TS" in s
 
-    desired: Dict[str, str] = {
-        "user_id": "INTEGER",
-        "symbol": "TEXT",
-        "timeframe": "TEXT",
-        "rr": "REAL",
-        "ts_sent": "INTEGER",
-        "ts": "INTEGER",
-    }
-    for col, decl in desired.items():
-        _ensure_column(conn, "autopost_log", col, decl)
+        if not has_unique:
+            # пересобираємо таблицю з потрібним UNIQUE
+            cur.executescript("""
+            CREATE TABLE IF NOT EXISTS autopost_log_new(
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id   INTEGER DEFAULT 0,
+                symbol    TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                rr        REAL,
+                ts_sent   INTEGER,
+                ts        INTEGER,
+                UNIQUE(user_id, symbol, timeframe, ts)
+            );
+            INSERT OR IGNORE INTO autopost_log_new(user_id, symbol, timeframe, rr, ts_sent, ts)
+            SELECT user_id, symbol, timeframe, rr, ts_sent, ts FROM autopost_log;
+            DROP TABLE autopost_log;
+            ALTER TABLE autopost_log_new RENAME TO autopost_log;
+            """)
+    conn.commit()
 
+    # звичайні індекси додатково — ок
     _ensure_index(conn, "ix_autopost_user_sym_tf_ts",
-                  "CREATE INDEX IF NOT EXISTS ix_autopost_user_sym_tf_ts "
-                  "ON autopost_log(user_id, symbol, timeframe, ts)")
+        "CREATE INDEX IF NOT EXISTS ix_autopost_user_sym_tf_ts "
+        "ON autopost_log(user_id, symbol, timeframe, ts)")
+
 
 
 def _ensure_indexes_and_triggers(conn: sqlite3.Connection) -> None:
