@@ -1,8 +1,9 @@
+# utils/db_migrate.py
 from __future__ import annotations
 import logging
 import os
 import sqlite3
-from typing import Dict, Iterable, Tuple, Any
+from typing import Dict, Tuple, Any
 
 from utils.db import get_conn
 
@@ -16,7 +17,7 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> Dict[str, Tuple[str,
     """
     Повертає {col_name: (col_type, notnull, dflt_value)}.
     """
-    cols = {}
+    cols: Dict[str, Tuple[str, int, Any]] = {}
     for cid, name, ctype, notnull, dflt_value, pk in conn.execute(f"PRAGMA table_info({table})"):
         cols[name] = (ctype or "", int(notnull or 0), dflt_value)
     return cols
@@ -36,8 +37,9 @@ def _ensure_table(conn: sqlite3.Connection, table_sql: str) -> None:
 
 def _ensure_column(conn: sqlite3.Connection, table: str, col_name: str, decl: str) -> None:
     """
-    Додає колонку, якщо її немає. decl — повний фрагмент оголошення типу (наприклад 'REAL', 'TEXT', 'INTEGER').
-    УВАГА: для SQLite ALTER TABLE ADD COLUMN не підтримує NOT NULL без дефолта – використовуємо м'які типи.
+    Додає колонку, якщо її немає.
+    УВАГА: SQLite ALTER TABLE ADD COLUMN не підтримує NOT NULL без дефолта,
+    тому в decl не ставимо NOT NULL без DEFAULT.
     """
     cols = _table_columns(conn, table)
     if col_name not in cols:
@@ -103,7 +105,6 @@ def _ensure_signals(conn: sqlite3.Connection) -> None:
             reject_reason TEXT
         )""")
 
-    # доганяємо колонки (міграція 004 та інші)
     desired: Dict[str, str] = {
         "user_id": "INTEGER",
         "symbol": "TEXT",
@@ -142,7 +143,6 @@ def _ensure_signals(conn: sqlite3.Connection) -> None:
     for col, decl in desired.items():
         _ensure_column(conn, "signals", col, decl)
 
-    # індекси
     _ensure_index(conn, "ix_signals_closed_at",
                   "CREATE INDEX IF NOT EXISTS ix_signals_closed_at ON signals(closed_at)")
     _ensure_index(conn, "ix_signals_status",
@@ -225,8 +225,16 @@ def _ensure_trades(conn: sqlite3.Connection) -> None:
     for col, decl in desired.items():
         _ensure_column(conn, "trades", col, decl)
 
+    _ensure_index(conn, "ix_trades_closed_at",
+                  "CREATE INDEX IF NOT EXISTS ix_trades_closed_at ON trades(closed_at)")
+
 
 def _ensure_user_settings(conn: sqlite3.Connection) -> None:
+    """
+    Історично `user_settings` була KV-таблицею (user_id, key, value).
+    Для сумісності з кодом, який читає колонками (autopost, autopost_rr, rr_threshold, neutral_mode),
+    додаємо ці колонки напряму до цієї ж таблиці. Це безпечно: KV-схема лишається працездатною.
+    """
     if not _has_table(conn, "user_settings"):
         _ensure_table(conn, """
         CREATE TABLE IF NOT EXISTS user_settings(
@@ -237,6 +245,16 @@ def _ensure_user_settings(conn: sqlite3.Connection) -> None:
             UNIQUE(user_id, key)
         )""")
 
+    # ── колонки, які очікують панелі/хендлери
+    _ensure_column(conn, "user_settings", "autopost",      "INTEGER DEFAULT 1")
+    _ensure_column(conn, "user_settings", "autopost_rr",   "REAL DEFAULT 1.5")
+    _ensure_column(conn, "user_settings", "rr_threshold",  "REAL DEFAULT 1.5")
+    _ensure_column(conn, "user_settings", "neutral_mode",  "TEXT DEFAULT 'TRAIL'")
+
+    # індекси для швидких вибірок по user_id
+    _ensure_index(conn, "ix_user_settings_user_id",
+                  "CREATE INDEX IF NOT EXISTS ix_user_settings_user_id ON user_settings(user_id)")
+
 
 def _ensure_settings(conn: sqlite3.Connection) -> None:
     if not _has_table(conn, "settings"):
@@ -246,7 +264,7 @@ def _ensure_settings(conn: sqlite3.Connection) -> None:
             value  TEXT
         )""")
 
-    # дефолти (ключі з нашого чек-листа)
+    # дефолти (ключі з чек-листа)
     defaults = {
         "tz_name": "Europe/Kyiv",
         "kpi_days": "7",
@@ -305,6 +323,34 @@ def _ensure_autopost_log(conn: sqlite3.Connection) -> None:
                   "ON autopost_log(user_id, symbol, timeframe, ts)")
 
 
+def _ensure_indexes_and_triggers(conn: sqlite3.Connection) -> None:
+    """
+    Додаткові індекси/тригери для продуктивності та нормалізації значень.
+    """
+    cur = conn.cursor()
+    cur.executescript("""
+    -- індекси для швидких KPI/репортів
+    CREATE INDEX IF NOT EXISTS ix_trades_closed_at  ON trades(closed_at);
+    CREATE INDEX IF NOT EXISTS ix_signals_closed_at ON signals(closed_at);
+
+    -- нормалізація статусу на рівні БД
+    CREATE TRIGGER IF NOT EXISTS trg_trades_status_closed_up
+    AFTER INSERT ON trades
+    WHEN LOWER(COALESCE(NEW.status,''))='closed'
+    BEGIN
+      UPDATE trades SET status='CLOSED' WHERE rowid=NEW.rowid;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_trades_status_closed_upd
+    AFTER UPDATE OF status ON trades
+    WHEN LOWER(COALESCE(NEW.status,''))='closed'
+    BEGIN
+      UPDATE trades SET status='CLOSED' WHERE rowid=NEW.rowid;
+    END;
+    """)
+    conn.commit()
+
+
 # ──────────────────────────────────────────────
 # public entrypoints
 # ──────────────────────────────────────────────
@@ -320,39 +366,15 @@ def migrate_if_needed() -> None:
         conn.execute("PRAGMA foreign_keys=OFF;")   # схеми без FK
 
         _ensure_settings(conn)
-        _ensure_user_settings(conn)
+        _ensure_user_settings(conn)   # важливо перед панелями
         _ensure_signals(conn)
         _ensure_trades(conn)
         _ensure_autopost_log(conn)
+        _ensure_indexes_and_triggers(conn)
 
         conn.commit()
 
     log.info("[migrate] done -> %s", db_path)
-
-    # utils/db_migrate.py
-    def ensure_indexes_and_triggers(conn):
-        cur = conn.cursor()
-        cur.executescript("""
-        -- індекси для швидких KPI/репортів
-        CREATE INDEX IF NOT EXISTS ix_trades_closed_at  ON trades(closed_at);
-        CREATE INDEX IF NOT EXISTS ix_signals_closed_at ON signals(closed_at);
-
-        -- нормалізація статусу на рівні БД
-        CREATE TRIGGER IF NOT EXISTS trg_trades_status_closed_up
-        AFTER INSERT ON trades
-        WHEN LOWER(COALESCE(NEW.status,''))='closed'
-        BEGIN
-          UPDATE trades SET status='CLOSED' WHERE rowid=NEW.rowid;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_trades_status_closed_upd
-        AFTER UPDATE OF status ON trades
-        WHEN LOWER(COALESCE(NEW.status,''))='closed'
-        BEGIN
-          UPDATE trades SET status='CLOSED' WHERE rowid=NEW.rowid;
-        END;
-        """)
-        conn.commit()
 
 
 # зворотна сумісність на випадок, якщо десь звуть migrate()

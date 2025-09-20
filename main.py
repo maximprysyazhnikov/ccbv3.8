@@ -13,7 +13,8 @@ import utils.settings_cached  # noqa: F401
 
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
-
+from utils.db_migrate import migrate_if_needed
+migrate_if_needed()
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
 from telegram.ext import (
     Application,
