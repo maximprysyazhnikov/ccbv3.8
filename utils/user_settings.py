@@ -1,8 +1,11 @@
 # utils/user_settings.py
 from __future__ import annotations
 import sqlite3
+import logging
 from typing import Any, Dict
-from utils.db import get_conn  # ← ЄДИНИЙ шлях до БД
+from utils.db import get_conn  # ← єдиний шлях до БД
+
+log = logging.getLogger("user_settings")
 
 # ──────────────────────────────────────────────
 # schema bootstrap (ідемпотентно)
@@ -13,17 +16,17 @@ def _ensure_schema() -> None:
         # Колонкова схема (один рядок на user_id)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS user_settings(
-          id             INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id        INTEGER NOT NULL UNIQUE,
-          timeframe      TEXT    DEFAULT '15m',
-          autopost       INTEGER DEFAULT 0,
-          autopost_tf    TEXT    DEFAULT '15m',
-          autopost_rr    REAL    DEFAULT 1.5,
-          rr_threshold   REAL    DEFAULT 1.5,
-          model_key      TEXT    DEFAULT 'auto',
-          locale         TEXT    DEFAULT 'uk',
-          daily_tracker  INTEGER DEFAULT 0,
-          daily_rr       REAL    DEFAULT 3.0,
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id         INTEGER NOT NULL UNIQUE,
+          timeframe       TEXT    DEFAULT '15m',
+          autopost        INTEGER DEFAULT 0,
+          autopost_tf     TEXT    DEFAULT '15m',
+          autopost_rr     REAL    DEFAULT 1.5,
+          rr_threshold    REAL    DEFAULT 1.5,
+          model_key       TEXT    DEFAULT 'auto',
+          locale          TEXT    DEFAULT 'uk',
+          daily_tracker   INTEGER DEFAULT 0,
+          daily_rr        REAL    DEFAULT 3.0,
           winrate_tracker INTEGER DEFAULT 0
         )
         """)
@@ -47,6 +50,7 @@ def _ensure_schema() -> None:
                 try:
                     cur.execute(ddl)
                 except sqlite3.OperationalError:
+                    # колонка вже могла зʼявитися між інстансами — ок
                     pass
         c.commit()
 
@@ -56,6 +60,7 @@ _ensure_schema()
 # helpers
 # ──────────────────────────────────────────────
 def ensure_user_row(user_id: int) -> None:
+    """Гарантує якірний рядок для user_id (щоб UPDATE завжди мав що оновлювати)."""
     with get_conn() as c:
         c.execute("""
             INSERT INTO user_settings(user_id) VALUES (?)
@@ -81,12 +86,28 @@ def set_user_settings(user_id: int, **kwargs: Any) -> None:
     """
     Гнучкий апдейт полів user_settings.
     Приклад: set_user_settings(123, autopost_rr=2.0, autopost=1)
+    Додає детальний лог: скільки рядків оновлено та які поля.
     """
     if not kwargs:
         return
     ensure_user_row(user_id)
+
     cols = [f"{k}=?" for k in kwargs.keys()]
     vals = list(kwargs.values()) + [user_id]
+
     with get_conn() as c:
-        c.execute(f"UPDATE user_settings SET {', '.join(cols)} WHERE user_id=?", vals)
+        cur = c.execute(f"UPDATE user_settings SET {', '.join(cols)} WHERE user_id=?", vals)
         c.commit()
+        # діагностика
+        try:
+            log.info("set_user_settings uid=%s updated=%s data=%s",
+                     user_id, cur.rowcount, kwargs)
+        except Exception:
+            # лог — не критичний, не ламаємо основний потік
+            pass
+
+# (опційно) зручно для тимчасового дебагу у логах:
+def _debug_dump() -> None:
+    with get_conn() as c:
+        rows = c.execute("SELECT user_id, autopost, autopost_rr, rr_threshold FROM user_settings").fetchall()
+        log.info("[debug_dump] %s", rows)
