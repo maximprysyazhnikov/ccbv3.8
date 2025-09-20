@@ -3,17 +3,18 @@ from __future__ import annotations
 import sqlite3
 import logging
 from typing import Any, Dict
-from utils.db import get_conn  # ← єдиний шлях до БД
+from utils.db import get_conn  # єдиний шлях до БД
 
 log = logging.getLogger("user_settings")
 
 # ──────────────────────────────────────────────
-# schema bootstrap (ідемпотентно)
+# schema bootstrap (ідемпотентно) + МІГРАЦІЯ UNIQUE(user_id)
 # ──────────────────────────────────────────────
 def _ensure_schema() -> None:
     with get_conn() as c:
         cur = c.cursor()
-        # Колонкова схема (один рядок на user_id)
+
+        # 1) Базова таблиця (для нових БД одразу з UNIQUE)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS user_settings(
           id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,9 +31,10 @@ def _ensure_schema() -> None:
           winrate_tracker INTEGER DEFAULT 0
         )
         """)
-        # Додаємо відсутні колонки (мʼяко)
+
+        # 2) Ідемпотентно додаємо відсутні колонки (для старих БД)
         cur.execute("PRAGMA table_info(user_settings)")
-        have = {r[1] for r in cur.fetchall()}
+        have_cols = {r[1] for r in cur.fetchall()}
         add_cols = {
             "timeframe":       "ALTER TABLE user_settings ADD COLUMN timeframe TEXT DEFAULT '15m'",
             "autopost":        "ALTER TABLE user_settings ADD COLUMN autopost INTEGER DEFAULT 0",
@@ -46,12 +48,49 @@ def _ensure_schema() -> None:
             "winrate_tracker": "ALTER TABLE user_settings ADD COLUMN winrate_tracker INTEGER DEFAULT 0",
         }
         for col, ddl in add_cols.items():
-            if col not in have:
+            if col not in have_cols:
                 try:
                     cur.execute(ddl)
                 except sqlite3.OperationalError:
-                    # колонка вже могла зʼявитися між інстансами — ок
                     pass
+
+        # 3) Гарантуємо унікальність user_id для старих таблиць:
+        #    - якщо індексу нема → створимо,
+        #    - але перед цим приберемо дублікати user_id (залишимо запис із найбільшим id)
+        cur.execute("PRAGMA index_list(user_settings)")
+        idx_names = {r[1] for r in cur.fetchall()}
+        if "idx_user_settings_user_id" not in idx_names:
+            try:
+                # приберемо дублі, якщо вони є
+                cur.executescript("""
+                DELETE FROM user_settings
+                WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id,
+                               ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY id DESC) AS rn
+                        FROM user_settings
+                    ) t
+                    WHERE t.rn > 1
+                );
+                """)
+            except sqlite3.OperationalError:
+                # старі SQLite без window-функцій: fallback через self-join
+                cur.executescript("""
+                DELETE FROM user_settings
+                WHERE id IN (
+                    SELECT u1.id
+                    FROM user_settings u1
+                    JOIN user_settings u2
+                      ON u1.user_id = u2.user_id AND u1.id < u2.id
+                );
+                """)
+
+            # створюємо унікальний індекс (ідеально для ON CONFLICT(user_id))
+            try:
+                cur.execute("CREATE UNIQUE INDEX idx_user_settings_user_id ON user_settings(user_id)")
+            except sqlite3.OperationalError:
+                pass
+
         c.commit()
 
 _ensure_schema()
@@ -62,10 +101,8 @@ _ensure_schema()
 def ensure_user_row(user_id: int) -> None:
     """Гарантує якірний рядок для user_id (щоб UPDATE завжди мав що оновлювати)."""
     with get_conn() as c:
-        c.execute("""
-            INSERT INTO user_settings(user_id) VALUES (?)
-            ON CONFLICT(user_id) DO NOTHING
-        """, (user_id,))
+        # INSERT OR IGNORE працює як з унікальним індексом, так і без нього (на випадок дуже старої БД)
+        c.execute("INSERT OR IGNORE INTO user_settings(user_id) VALUES (?)", (user_id,))
         c.commit()
 
 def get_user_settings(user_id: int) -> Dict[str, Any]:
@@ -86,7 +123,6 @@ def set_user_settings(user_id: int, **kwargs: Any) -> None:
     """
     Гнучкий апдейт полів user_settings.
     Приклад: set_user_settings(123, autopost_rr=2.0, autopost=1)
-    Додає детальний лог: скільки рядків оновлено та які поля.
     """
     if not kwargs:
         return
@@ -98,15 +134,9 @@ def set_user_settings(user_id: int, **kwargs: Any) -> None:
     with get_conn() as c:
         cur = c.execute(f"UPDATE user_settings SET {', '.join(cols)} WHERE user_id=?", vals)
         c.commit()
-        # діагностика
-        try:
-            log.info("set_user_settings uid=%s updated=%s data=%s",
-                     user_id, cur.rowcount, kwargs)
-        except Exception:
-            # лог — не критичний, не ламаємо основний потік
-            pass
+        log.info("set_user_settings uid=%s updated=%s data=%s", user_id, cur.rowcount, kwargs)
 
-# (опційно) зручно для тимчасового дебагу у логах:
+# (опційно) для швидкого дебагу:
 def _debug_dump() -> None:
     with get_conn() as c:
         rows = c.execute("SELECT user_id, autopost, autopost_rr, rr_threshold FROM user_settings").fetchall()
